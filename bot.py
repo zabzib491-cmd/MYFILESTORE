@@ -8,10 +8,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from telegram import (
-    Update,
-    InputMediaVideo,
-)
+from telegram import Update, InputMediaVideo
 from telegram.constants import ChatType
 from telegram.error import (
     TelegramError,
@@ -35,22 +32,15 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv("MONGO_URI", "")
 
-# Example:
-# ADMIN_IDS=123456789,987654321
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
 
-# Delay between album batches
-# Conservative default
 SEND_DELAY = float(os.getenv("SEND_DELAY", "5"))
-
-# Maximum retries for temporary network errors
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
 
-# Telegram album size
 ALBUM_SIZE = 10
 
 
@@ -79,6 +69,7 @@ settings = None
 
 
 async def init_db():
+
     global mongo_client
     global db
     global videos
@@ -95,10 +86,6 @@ async def init_db():
     videos = db["videos"]
     jobs = db["jobs"]
     settings = db["settings"]
-
-    # --------------------------------------------------------
-    # INDEXES
-    # --------------------------------------------------------
 
     await videos.create_index(
         [("file_unique_id", ASCENDING)],
@@ -136,10 +123,6 @@ async def init_db():
         name="job_created",
     )
 
-    # --------------------------------------------------------
-    # TEST CONNECTION
-    # --------------------------------------------------------
-
     await db.command("ping")
 
     logger.info("MongoDB connected successfully")
@@ -154,6 +137,7 @@ def is_admin(user_id: int) -> bool:
 
 
 async def admin_only(update: Update) -> bool:
+
     user = update.effective_user
 
     if not user:
@@ -171,13 +155,6 @@ def now():
 # ============================================================
 
 def get_video_from_message(message):
-    """
-    Extract video information.
-
-    Only Telegram VIDEO is accepted.
-    Photos, documents, animations, text and links
-    are ignored.
-    """
 
     if not message:
         return None
@@ -203,16 +180,13 @@ def get_video_from_message(message):
 # ============================================================
 
 async def save_video_message(message):
+
     data = get_video_from_message(message)
 
     if not data:
         return False, None
 
     file_unique_id = data["file_unique_id"]
-
-    # --------------------------------------------------------
-    # DUPLICATE CHECK
-    # --------------------------------------------------------
 
     existing = await videos.find_one(
         {
@@ -226,10 +200,6 @@ async def save_video_message(message):
 
     if existing:
         return False, existing.get("seq")
-
-    # --------------------------------------------------------
-    # ATOMIC SEQUENCE
-    # --------------------------------------------------------
 
     counter = await settings.find_one_and_update(
         {
@@ -245,10 +215,6 @@ async def save_video_message(message):
     )
 
     seq = counter["value"]
-
-    # --------------------------------------------------------
-    # SOURCE INFORMATION
-    # --------------------------------------------------------
 
     chat = message.chat
 
@@ -268,10 +234,6 @@ async def save_video_message(message):
             )
             or ""
         )
-
-    # --------------------------------------------------------
-    # DOCUMENT
-    # --------------------------------------------------------
 
     document = {
         "seq": seq,
@@ -347,9 +309,6 @@ async def video_handler(
             message
         )
 
-        # Only reply in private chat.
-        # Never spam groups/channels.
-
         if (
             saved
             and message.chat.type == ChatType.PRIVATE
@@ -399,6 +358,7 @@ async def start_command(
         "/search <text>\n"
         "/send <ID> <CHAT_ID>\n"
         "/sendall <CHAT_ID>\n"
+        "/sendal <CHAT_ID>\n"
         "/delete <ID>\n"
         "/pause\n"
         "/resume\n"
@@ -471,6 +431,7 @@ async def list_command(
     if context.args:
 
         try:
+
             limit = int(
                 context.args[0]
             )
@@ -812,6 +773,43 @@ async def sendall_command(
 
         return
 
+    # --------------------------------------------------------
+    # CHECK DESTINATION FIRST
+    # --------------------------------------------------------
+
+    try:
+
+        chat = await context.bot.get_chat(
+            chat_id
+        )
+
+        logger.info(
+            "SENDALL DESTINATION | ID=%s | TITLE=%s | TYPE=%s",
+            chat_id,
+            getattr(chat, "title", ""),
+            getattr(chat, "type", ""),
+        )
+
+    except TelegramError as e:
+
+        logger.exception(
+            "Destination chat check failed"
+        )
+
+        await update.effective_message.reply_text(
+            "❌ Destination chat cannot be accessed.\n\n"
+            f"Chat ID: {chat_id}\n"
+            f"Error: {str(e)[:700]}\n\n"
+            "Make sure the bot is inside the group/channel "
+            "and has permission to send messages."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ACTIVE JOB CHECK
+    # --------------------------------------------------------
+
     active_job = await jobs.find_one(
         {
             "status": {
@@ -858,6 +856,21 @@ async def sendall_command(
         f"📤 Destination: `{chat_id}`\n\n"
         f"🆔 Job: `{str(job_id)}`",
         parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# /SENDAL
+# ============================================================
+
+async def sendal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await sendall_command(
+        update,
+        context,
     )
 
 
@@ -1177,12 +1190,16 @@ async def send_queue_worker(
 ):
 
     logger.info(
-        "Send queue worker started"
+        "SEND QUEUE WORKER STARTED"
     )
 
     while True:
 
         try:
+
+            # ------------------------------------------------
+            # PICK QUEUED JOB
+            # ------------------------------------------------
 
             job = (
                 await jobs.find_one_and_update(
@@ -1207,11 +1224,21 @@ async def send_queue_worker(
                 )
             )
 
+            # ------------------------------------------------
+            # NO JOB
+            # ------------------------------------------------
+
             if not job:
 
                 await asyncio.sleep(2)
 
                 continue
+
+            logger.info(
+                "SEND JOB PICKED | JOB=%s | CHAT=%s",
+                job["_id"],
+                job.get("chat_id"),
+            )
 
             await process_send_job(
                 application,
@@ -1254,15 +1281,55 @@ async def process_send_job(
     )
 
     logger.info(
-        "Processing send job %s",
+        "PROCESSING SEND JOB | JOB=%s | CHAT=%s | LAST=%s",
         job_id,
+        chat_id,
+        last_seq,
     )
 
-    while True:
+    # --------------------------------------------------------
+    # VERIFY DESTINATION
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # GET CURRENT JOB
-        # ----------------------------------------------------
+    try:
+
+        chat = await application.bot.get_chat(
+            chat_id
+        )
+
+        logger.info(
+            "DESTINATION OK | CHAT=%s | TYPE=%s | TITLE=%s",
+            chat_id,
+            getattr(chat, "type", ""),
+            getattr(chat, "title", ""),
+        )
+
+    except TelegramError as e:
+
+        logger.exception(
+            "Destination unavailable"
+        )
+
+        await jobs.update_one(
+            {
+                "_id": job_id
+            },
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": str(e)[:2000],
+                    "updated_at": now(),
+                }
+            },
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
+    while True:
 
         current_job = await jobs.find_one(
             {
@@ -1272,20 +1339,33 @@ async def process_send_job(
 
         if not current_job:
 
+            logger.error(
+                "Job disappeared | JOB=%s",
+                job_id,
+            )
+
             return
 
         status = current_job.get(
             "status"
         )
 
+        # ----------------------------------------------------
+        # CANCEL
+        # ----------------------------------------------------
+
         if status == "cancelled":
 
             logger.info(
-                "Job %s cancelled",
+                "Job cancelled | JOB=%s",
                 job_id,
             )
 
             return
+
+        # ----------------------------------------------------
+        # PAUSE
+        # ----------------------------------------------------
 
         if status == "paused":
 
@@ -1316,6 +1396,10 @@ async def process_send_job(
             length=ALBUM_SIZE
         )
 
+        # ----------------------------------------------------
+        # FINISHED
+        # ----------------------------------------------------
+
         if not batch:
 
             await jobs.update_one(
@@ -1331,7 +1415,7 @@ async def process_send_job(
             )
 
             logger.info(
-                "Job %s completed",
+                "SEND JOB COMPLETED | JOB=%s",
                 job_id,
             )
 
@@ -1357,8 +1441,19 @@ async def process_send_job(
                 )
             )
 
+        first_id = batch[0]["seq"]
+        last_id = batch[-1]["seq"]
+
+        logger.info(
+            "SENDING ALBUM | JOB=%s | FROM=%s | TO=%s | COUNT=%s",
+            job_id,
+            first_id,
+            last_id,
+            len(batch),
+        )
+
         # ----------------------------------------------------
-        # SEND ALBUM
+        # SEND
         # ----------------------------------------------------
 
         try:
@@ -1371,7 +1466,7 @@ async def process_send_job(
 
             sent_count = len(batch)
 
-            last_seq = batch[-1]["seq"]
+            last_seq = last_id
 
             await jobs.update_one(
                 {
@@ -1389,25 +1484,80 @@ async def process_send_job(
             )
 
             logger.info(
-                "Job %s | sent=%s | last=%s",
+                "ALBUM SENT | JOB=%s | SENT=%s | LAST=%s",
                 job_id,
                 sent_count,
                 last_seq,
             )
 
+        except RetryAfter as e:
+
+            wait_time = int(
+                e.retry_after
+            ) + 2
+
+            logger.warning(
+                "FloodWait while processing job | WAIT=%s",
+                wait_time,
+            )
+
+            await asyncio.sleep(
+                wait_time
+            )
+
+            continue
+
+        except (
+            TimedOut,
+            NetworkError,
+        ) as e:
+
+            logger.warning(
+                "Temporary network error: %s",
+                e,
+            )
+
+            await asyncio.sleep(5)
+
+            continue
+
         except TelegramError as e:
 
             logger.error(
-                "Album failed for job %s: %s",
+                "Telegram error | JOB=%s | ERROR=%s",
                 job_id,
                 e,
             )
 
             # ------------------------------------------------
-            # Move past failed batch
+            # Count failed batch and continue
             # ------------------------------------------------
 
-            last_seq = batch[-1]["seq"]
+            last_seq = last_id
+
+            await jobs.update_one(
+                {
+                    "_id": job_id
+                },
+                {
+                    "$set": {
+                        "last_seq": last_seq,
+                        "updated_at": now(),
+                    },
+                    "$inc": {
+                        "failed": len(batch),
+                    },
+                },
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Unexpected album error | JOB=%s",
+                job_id,
+            )
+
+            last_seq = last_id
 
             await jobs.update_one(
                 {
@@ -1425,7 +1575,7 @@ async def process_send_job(
             )
 
         # ----------------------------------------------------
-        # SAFE DELAY
+        # DELAY
         # ----------------------------------------------------
 
         await asyncio.sleep(
@@ -1446,14 +1596,27 @@ async def on_startup(
 
     await init_db()
 
-    application.create_task(
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Create worker and keep a reference to it.
+    # --------------------------------------------------------
+
+    worker_task = asyncio.create_task(
         send_queue_worker(
             application
         )
     )
 
+    application.bot_data[
+        "send_worker_task"
+    ] = worker_task
+
     logger.info(
         "Video Storage Bot started"
+    )
+
+    logger.info(
+        "Send queue worker launched"
     )
 
 
@@ -1471,44 +1634,6 @@ async def error_handler(
         context.error,
         exc_info=context.error,
     )
-
-
-# ============================================================
-# PYTHON 3.14 EVENT LOOP FIX
-# ============================================================
-
-def run_application(
-    application,
-):
-
-    """
-    Python 3.14 compatibility.
-
-    python-telegram-bot 22.3's run_polling()
-    expects a current event loop.
-    """
-
-    loop = asyncio.new_event_loop()
-
-    asyncio.set_event_loop(
-        loop
-    )
-
-    try:
-
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES
-        )
-
-    finally:
-
-        try:
-
-            loop.close()
-
-        except Exception:
-
-            pass
 
 
 # ============================================================
@@ -1596,6 +1721,14 @@ def main():
         )
     )
 
+    # /sendal alias
+    application.add_handler(
+        CommandHandler(
+            "sendal",
+            sendal_command,
+        )
+    )
+
     application.add_handler(
         CommandHandler(
             "delete",
@@ -1633,14 +1766,6 @@ def main():
 
     # --------------------------------------------------------
     # AUTO VIDEO SAVE
-    #
-    # Private
-    # Group
-    # Supergroup
-    # Channel
-    #
-    # Only VIDEO messages are saved.
-    # Text / links / photos / documents are ignored.
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1663,11 +1788,15 @@ def main():
     )
 
     # --------------------------------------------------------
-    # PYTHON 3.14 SAFE RUN
+    # NORMAL RUN POLLING
+    #
+    # No manual event-loop close.
+    # This avoids the Python 3.14 shutdown problem.
     # --------------------------------------------------------
 
-    run_application(
-        application
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=True,
     )
 
 
