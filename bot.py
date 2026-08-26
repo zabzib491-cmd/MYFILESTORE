@@ -41,6 +41,7 @@ ADMIN_IDS = {
 SEND_DELAY = float(os.getenv("SEND_DELAY", "5"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
 
+# Telegram maximum media group size
 ALBUM_SIZE = 10
 
 
@@ -61,12 +62,23 @@ logger = logging.getLogger("VideoStorageBot")
 # ============================================================
 
 mongo_client: Optional[AsyncIOMotorClient] = None
-db = None
 
+db = None
 videos = None
 jobs = None
 settings = None
 
+
+# ============================================================
+# GLOBAL WORKER
+# ============================================================
+
+send_worker_task = None
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
 
 async def init_db():
 
@@ -86,6 +98,10 @@ async def init_db():
     videos = db["videos"]
     jobs = db["jobs"]
     settings = db["settings"]
+
+    # --------------------------------------------------------
+    # INDEXES
+    # --------------------------------------------------------
 
     await videos.create_index(
         [("file_unique_id", ASCENDING)],
@@ -188,6 +204,10 @@ async def save_video_message(message):
 
     file_unique_id = data["file_unique_id"]
 
+    # --------------------------------------------------------
+    # DUPLICATE CHECK
+    # --------------------------------------------------------
+
     existing = await videos.find_one(
         {
             "file_unique_id": file_unique_id
@@ -199,7 +219,12 @@ async def save_video_message(message):
     )
 
     if existing:
+
         return False, existing.get("seq")
+
+    # --------------------------------------------------------
+    # ATOMIC SEQUENCE
+    # --------------------------------------------------------
 
     counter = await settings.find_one_and_update(
         {
@@ -216,6 +241,10 @@ async def save_video_message(message):
 
     seq = counter["value"]
 
+    # --------------------------------------------------------
+    # SOURCE
+    # --------------------------------------------------------
+
     chat = message.chat
 
     source_chat_id = chat.id if chat else None
@@ -224,6 +253,7 @@ async def save_video_message(message):
     source_title = ""
 
     if chat:
+
         source_title = (
             chat.title
             or chat.username
@@ -235,7 +265,12 @@ async def save_video_message(message):
             or ""
         )
 
+    # --------------------------------------------------------
+    # DOCUMENT
+    # --------------------------------------------------------
+
     document = {
+
         "seq": seq,
 
         "file_id": data["file_id"],
@@ -282,7 +317,7 @@ async def save_video_message(message):
             False,
             existing.get("seq")
             if existing
-            else None
+            else None,
         )
 
 
@@ -305,9 +340,7 @@ async def video_handler(
 
     try:
 
-        saved, seq = await save_video_message(
-            message
-        )
+        saved, seq = await save_video_message(message)
 
         if (
             saved
@@ -339,9 +372,7 @@ async def start_command(
     if not update.effective_user:
         return
 
-    if not is_admin(
-        update.effective_user.id
-    ):
+    if not is_admin(update.effective_user.id):
 
         await update.effective_message.reply_text(
             "🎥 Send a video to store it."
@@ -351,14 +382,15 @@ async def start_command(
 
     await update.effective_message.reply_text(
         "🎥 VIDEO STORAGE BOT\n\n"
+
         "Videos are saved automatically.\n\n"
+
         "Admin commands:\n"
         "/stats\n"
         "/list [limit]\n"
         "/search <text>\n"
         "/send <ID> <CHAT_ID>\n"
         "/sendall <CHAT_ID>\n"
-        "/sendal <CHAT_ID>\n"
         "/delete <ID>\n"
         "/pause\n"
         "/resume\n"
@@ -432,9 +464,7 @@ async def list_command(
 
         try:
 
-            limit = int(
-                context.args[0]
-            )
+            limit = int(context.args[0])
 
             limit = min(
                 max(limit, 1),
@@ -710,6 +740,7 @@ async def create_send_job(
 ):
 
     job = {
+
         "type": "sendall",
 
         "chat_id": chat_id,
@@ -729,9 +760,7 @@ async def create_send_job(
         "updated_at": now(),
     }
 
-    result = await jobs.insert_one(
-        job
-    )
+    result = await jobs.insert_one(job)
 
     return result.inserted_id
 
@@ -773,43 +802,6 @@ async def sendall_command(
 
         return
 
-    # --------------------------------------------------------
-    # CHECK DESTINATION FIRST
-    # --------------------------------------------------------
-
-    try:
-
-        chat = await context.bot.get_chat(
-            chat_id
-        )
-
-        logger.info(
-            "SENDALL DESTINATION | ID=%s | TITLE=%s | TYPE=%s",
-            chat_id,
-            getattr(chat, "title", ""),
-            getattr(chat, "type", ""),
-        )
-
-    except TelegramError as e:
-
-        logger.exception(
-            "Destination chat check failed"
-        )
-
-        await update.effective_message.reply_text(
-            "❌ Destination chat cannot be accessed.\n\n"
-            f"Chat ID: {chat_id}\n"
-            f"Error: {str(e)[:700]}\n\n"
-            "Make sure the bot is inside the group/channel "
-            "and has permission to send messages."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ACTIVE JOB CHECK
-    # --------------------------------------------------------
-
     active_job = await jobs.find_one(
         {
             "status": {
@@ -843,34 +835,57 @@ async def sendall_command(
 
         return
 
+    # --------------------------------------------------------
+    # CHECK DESTINATION BEFORE CREATING JOB
+    # --------------------------------------------------------
+
+    try:
+
+        chat = await context.bot.get_chat(
+            chat_id
+        )
+
+        logger.info(
+            "SENDALL DESTINATION | id=%s | type=%s | title=%s",
+            chat_id,
+            chat.type,
+            getattr(chat, "title", ""),
+        )
+
+    except TelegramError as e:
+
+        logger.exception(
+            "Destination check failed"
+        )
+
+        await update.effective_message.reply_text(
+            "❌ Cannot access destination.\n\n"
+            f"{str(e)[:1000]}\n\n"
+            "Make sure the bot is a member/admin "
+            "of the group or channel."
+        )
+
+        return
+
     job_id = await create_send_job(
         chat_id=chat_id,
-        created_by=(
-            update.effective_user.id
-        ),
+        created_by=update.effective_user.id,
     )
 
     await update.effective_message.reply_text(
-        "🚀 SEND JOB CREATED\n\n"
-        f"🎥 Total: {total:,}\n"
+        "🚀 SEND ALL STARTED\n\n"
+        f"🎥 Total Videos: {total:,}\n"
         f"📤 Destination: `{chat_id}`\n\n"
-        f"🆔 Job: `{str(job_id)}`",
+        f"🆔 Job: `{str(job_id)}`\n\n"
+        "⏳ Sending will continue in background...",
         parse_mode="Markdown",
     )
 
-
-# ============================================================
-# /SENDAL
-# ============================================================
-
-async def sendal_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await sendall_command(
-        update,
-        context,
+    logger.info(
+        "SENDALL JOB CREATED | job=%s | chat=%s | total=%s",
+        job_id,
+        chat_id,
+        total,
     )
 
 
@@ -1104,10 +1119,8 @@ async def job_command(
         f"✅ Sent: {sent:,}\n"
         f"❌ Failed: {failed:,}\n"
         f"⏳ Remaining: {remaining:,}\n"
-        f"🔢 Last ID: "
-        f"{job.get('last_seq', 0):,}\n"
-        f"📍 Chat: "
-        f"{job.get('chat_id')}"
+        f"🔢 Last ID: {job.get('last_seq', 0):,}\n"
+        f"📍 Chat: {job.get('chat_id')}"
     )
 
 
@@ -1134,13 +1147,12 @@ async def send_album_with_retry(
 
         except RetryAfter as e:
 
-            wait_time = (
-                int(e.retry_after)
-                + 2
-            )
+            wait_time = int(
+                e.retry_after
+            ) + 2
 
             logger.warning(
-                "FloodWait: sleeping %s seconds",
+                "FloodWait | %s seconds",
                 wait_time,
             )
 
@@ -1161,8 +1173,7 @@ async def send_album_with_retry(
             )
 
             logger.warning(
-                "Network error. "
-                "Retry %s/%s in %ss",
+                "Network error | retry %s/%s | wait=%ss",
                 attempts,
                 MAX_RETRIES,
                 wait_time,
@@ -1197,36 +1208,24 @@ async def send_queue_worker(
 
         try:
 
-            # ------------------------------------------------
-            # PICK QUEUED JOB
-            # ------------------------------------------------
-
-            job = (
-                await jobs.find_one_and_update(
-                    {
-                        "status": "queued"
-                    },
-                    {
-                        "$set": {
-                            "status": "running",
-                            "updated_at": now(),
-                        }
-                    },
-                    sort=[
-                        (
-                            "created_at",
-                            ASCENDING,
-                        )
-                    ],
-                    return_document=(
-                        ReturnDocument.AFTER
-                    ),
-                )
+            job = await jobs.find_one_and_update(
+                {
+                    "status": "queued"
+                },
+                {
+                    "$set": {
+                        "status": "running",
+                        "updated_at": now(),
+                    }
+                },
+                sort=[
+                    (
+                        "created_at",
+                        ASCENDING,
+                    )
+                ],
+                return_document=ReturnDocument.AFTER,
             )
-
-            # ------------------------------------------------
-            # NO JOB
-            # ------------------------------------------------
 
             if not job:
 
@@ -1235,9 +1234,9 @@ async def send_queue_worker(
                 continue
 
             logger.info(
-                "SEND JOB PICKED | JOB=%s | CHAT=%s",
+                "SEND QUEUE PICKED JOB | job=%s | chat=%s",
                 job["_id"],
-                job.get("chat_id"),
+                job["chat_id"],
             )
 
             await process_send_job(
@@ -1248,15 +1247,15 @@ async def send_queue_worker(
         except asyncio.CancelledError:
 
             logger.info(
-                "Queue worker stopped"
+                "SEND QUEUE WORKER STOPPED"
             )
 
-            break
+            raise
 
         except Exception:
 
             logger.exception(
-                "Queue worker error"
+                "SEND QUEUE WORKER ERROR"
             )
 
             await asyncio.sleep(5)
@@ -1281,14 +1280,14 @@ async def process_send_job(
     )
 
     logger.info(
-        "PROCESSING SEND JOB | JOB=%s | CHAT=%s | LAST=%s",
+        "PROCESSING SEND JOB | job=%s | chat=%s | last=%s",
         job_id,
         chat_id,
         last_seq,
     )
 
     # --------------------------------------------------------
-    # VERIFY DESTINATION
+    # DESTINATION TEST
     # --------------------------------------------------------
 
     try:
@@ -1298,16 +1297,17 @@ async def process_send_job(
         )
 
         logger.info(
-            "DESTINATION OK | CHAT=%s | TYPE=%s | TITLE=%s",
+            "DESTINATION OK | id=%s | type=%s | title=%s",
             chat_id,
-            getattr(chat, "type", ""),
+            chat.type,
             getattr(chat, "title", ""),
         )
 
-    except TelegramError as e:
+    except Exception as e:
 
         logger.exception(
-            "Destination unavailable"
+            "DESTINATION ERROR | chat=%s",
+            chat_id,
         )
 
         await jobs.update_one(
@@ -1340,7 +1340,7 @@ async def process_send_job(
         if not current_job:
 
             logger.error(
-                "Job disappeared | JOB=%s",
+                "Job disappeared | %s",
                 job_id,
             )
 
@@ -1357,7 +1357,7 @@ async def process_send_job(
         if status == "cancelled":
 
             logger.info(
-                "Job cancelled | JOB=%s",
+                "Job cancelled | %s",
                 job_id,
             )
 
@@ -1374,7 +1374,15 @@ async def process_send_job(
             continue
 
         # ----------------------------------------------------
-        # GET NEXT 10 VIDEOS
+        # If failed externally
+        # ----------------------------------------------------
+
+        if status == "failed":
+
+            return
+
+        # ----------------------------------------------------
+        # GET NEXT 10
         # ----------------------------------------------------
 
         cursor = (
@@ -1397,7 +1405,7 @@ async def process_send_job(
         )
 
         # ----------------------------------------------------
-        # FINISHED
+        # COMPLETED
         # ----------------------------------------------------
 
         if not batch:
@@ -1415,8 +1423,10 @@ async def process_send_job(
             )
 
             logger.info(
-                "SEND JOB COMPLETED | JOB=%s",
+                "SEND JOB COMPLETED | job=%s | sent=%s | failed=%s",
                 job_id,
+                current_job.get("sent", 0),
+                current_job.get("failed", 0),
             )
 
             return
@@ -1445,7 +1455,7 @@ async def process_send_job(
         last_id = batch[-1]["seq"]
 
         logger.info(
-            "SENDING ALBUM | JOB=%s | FROM=%s | TO=%s | COUNT=%s",
+            "SENDING ALBUM | job=%s | IDs=%s-%s | count=%s",
             job_id,
             first_id,
             last_id,
@@ -1458,7 +1468,7 @@ async def process_send_job(
 
         try:
 
-            await send_album_with_retry(
+            result = await send_album_with_retry(
                 application.bot,
                 chat_id,
                 media,
@@ -1484,10 +1494,11 @@ async def process_send_job(
             )
 
             logger.info(
-                "ALBUM SENT | JOB=%s | SENT=%s | LAST=%s",
+                "ALBUM SENT | job=%s | count=%s | last=%s | telegram_messages=%s",
                 job_id,
                 sent_count,
                 last_seq,
+                len(result) if result else 0,
             )
 
         except RetryAfter as e:
@@ -1497,7 +1508,7 @@ async def process_send_job(
             ) + 2
 
             logger.warning(
-                "FloodWait while processing job | WAIT=%s",
+                "FLOODWAIT DURING JOB | %s seconds",
                 wait_time,
             )
 
@@ -1507,30 +1518,19 @@ async def process_send_job(
 
             continue
 
-        except (
-            TimedOut,
-            NetworkError,
-        ) as e:
-
-            logger.warning(
-                "Temporary network error: %s",
-                e,
-            )
-
-            await asyncio.sleep(5)
-
-            continue
-
         except TelegramError as e:
 
-            logger.error(
-                "Telegram error | JOB=%s | ERROR=%s",
+            logger.exception(
+                "TELEGRAM ERROR | job=%s | IDs=%s-%s",
                 job_id,
-                e,
+                first_id,
+                last_id,
             )
 
             # ------------------------------------------------
-            # Count failed batch and continue
+            # IMPORTANT:
+            # Do not keep retrying permanent errors forever.
+            # Move past this batch.
             # ------------------------------------------------
 
             last_seq = last_id
@@ -1543,6 +1543,7 @@ async def process_send_job(
                     "$set": {
                         "last_seq": last_seq,
                         "updated_at": now(),
+                        "last_error": str(e)[:2000],
                     },
                     "$inc": {
                         "failed": len(batch),
@@ -1553,7 +1554,7 @@ async def process_send_job(
         except Exception as e:
 
             logger.exception(
-                "Unexpected album error | JOB=%s",
+                "UNKNOWN SEND ERROR | job=%s",
                 job_id,
             )
 
@@ -1567,6 +1568,7 @@ async def process_send_job(
                     "$set": {
                         "last_seq": last_seq,
                         "updated_at": now(),
+                        "last_error": str(e)[:2000],
                     },
                     "$inc": {
                         "failed": len(batch),
@@ -1594,29 +1596,85 @@ async def on_startup(
     application,
 ):
 
+    global send_worker_task
+
     await init_db()
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # Create worker and keep a reference to it.
+    # RECOVER STALE RUNNING JOB
+    #
+    # If Render restarts while job is running,
+    # continue it instead of losing it.
     # --------------------------------------------------------
 
-    worker_task = asyncio.create_task(
+    await jobs.update_many(
+        {
+            "status": "running"
+        },
+        {
+            "$set": {
+                "status": "queued",
+                "updated_at": now(),
+            }
+        },
+    )
+
+    send_worker_task = asyncio.create_task(
         send_queue_worker(
             application
         )
     )
 
-    application.bot_data[
-        "send_worker_task"
-    ] = worker_task
-
     logger.info(
-        "Video Storage Bot started"
+        "Video Storage Bot startup complete"
     )
 
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+async def on_shutdown(
+    application,
+):
+
+    global send_worker_task
+    global mongo_client
+
     logger.info(
-        "Send queue worker launched"
+        "Bot shutdown started"
+    )
+
+    # --------------------------------------------------------
+    # STOP WORKER
+    # --------------------------------------------------------
+
+    if send_worker_task:
+
+        send_worker_task.cancel()
+
+        try:
+
+            await send_worker_task
+
+        except asyncio.CancelledError:
+
+            pass
+
+        send_worker_task = None
+
+    # --------------------------------------------------------
+    # MONGO
+    # --------------------------------------------------------
+
+    if mongo_client:
+
+        mongo_client.close()
+
+        mongo_client = None
+
+    logger.info(
+        "Bot shutdown completed"
     )
 
 
@@ -1637,41 +1695,18 @@ async def error_handler(
 
 
 # ============================================================
-# MAIN
+# PYTHON 3.14 SAFE ASYNC RUNNER
 # ============================================================
 
-def main():
+async def async_main():
 
-    # --------------------------------------------------------
-    # ENV CHECK
-    # --------------------------------------------------------
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN environment variable missing"
-        )
-
-    if not MONGO_URI:
-
-        raise RuntimeError(
-            "MONGO_URI environment variable missing"
-        )
-
-    if not ADMIN_IDS:
-
-        raise RuntimeError(
-            "ADMIN_IDS environment variable missing"
-        )
-
-    # --------------------------------------------------------
-    # APPLICATION
-    # --------------------------------------------------------
+    logger.info(
+        "Starting Video Storage Bot..."
+    )
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(on_startup)
         .build()
     )
 
@@ -1721,14 +1756,6 @@ def main():
         )
     )
 
-    # /sendal alias
-    application.add_handler(
-        CommandHandler(
-            "sendal",
-            sendal_command,
-        )
-    )
-
     application.add_handler(
         CommandHandler(
             "delete",
@@ -1765,7 +1792,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # AUTO VIDEO SAVE
+    # VIDEO HANDLER
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1783,20 +1810,154 @@ def main():
         error_handler
     )
 
+    # ========================================================
+    # MANUAL PTB STARTUP
+    #
+    # NO run_polling()
+    #
+    # This fixes Python 3.14:
+    # RuntimeError:
+    # There is no current event loop
+    # ========================================================
+
+    await application.initialize()
+
+    await on_startup(
+        application
+    )
+
+    await application.start()
+
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
     logger.info(
-        "Starting polling..."
+        "BOT IS ONLINE"
+    )
+
+    logger.info(
+        "SENDALL WORKER IS ONLINE"
     )
 
     # --------------------------------------------------------
-    # NORMAL RUN POLLING
-    #
-    # No manual event-loop close.
-    # This avoids the Python 3.14 shutdown problem.
+    # KEEP PROCESS ALIVE
     # --------------------------------------------------------
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=True,
+    stop_event = asyncio.Event()
+
+    try:
+
+        await stop_event.wait()
+
+    except asyncio.CancelledError:
+
+        logger.info(
+            "Main task cancelled"
+        )
+
+    finally:
+
+        # ----------------------------------------------------
+        # STOP POLLING
+        # ----------------------------------------------------
+
+        try:
+
+            if application.updater.running:
+
+                await application.updater.stop()
+
+        except Exception:
+
+            logger.exception(
+                "Error stopping updater"
+            )
+
+        # ----------------------------------------------------
+        # STOP APPLICATION
+        # ----------------------------------------------------
+
+        try:
+
+            if application.running:
+
+                await application.stop()
+
+        except Exception:
+
+            logger.exception(
+                "Error stopping application"
+            )
+
+        # ----------------------------------------------------
+        # CUSTOM SHUTDOWN
+        # ----------------------------------------------------
+
+        try:
+
+            await on_shutdown(
+                application
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Error during custom shutdown"
+            )
+
+        # ----------------------------------------------------
+        # PTB SHUTDOWN
+        # ----------------------------------------------------
+
+        try:
+
+            await application.shutdown()
+
+        except Exception:
+
+            logger.exception(
+                "Error during PTB shutdown"
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # --------------------------------------------------------
+    # ENV CHECK
+    # --------------------------------------------------------
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN environment variable missing"
+        )
+
+    if not MONGO_URI:
+
+        raise RuntimeError(
+            "MONGO_URI environment variable missing"
+        )
+
+    if not ADMIN_IDS:
+
+        raise RuntimeError(
+            "ADMIN_IDS environment variable missing"
+        )
+
+    # --------------------------------------------------------
+    # PYTHON 3.14
+    #
+    # asyncio.run() creates and manages the event loop.
+    # We do NOT use application.run_polling().
+    # --------------------------------------------------------
+
+    asyncio.run(
+        async_main()
     )
 
 
@@ -1805,4 +1966,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
