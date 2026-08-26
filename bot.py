@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from telegram import (
@@ -27,6 +27,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -42,12 +43,16 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
-# Delay between album batches.
-# Keep this conservative.
-SEND_DELAY = float(os.getenv("SEND_DELAY", "3"))
+# Delay between album batches
+# Conservative default
+SEND_DELAY = float(os.getenv("SEND_DELAY", "5"))
 
-# Maximum number of retry attempts for temporary errors
+# Maximum retries for temporary network errors
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
+
+# Telegram album size
+ALBUM_SIZE = 10
+
 
 # ============================================================
 # LOGGING
@@ -59,6 +64,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("VideoStorageBot")
+
 
 # ============================================================
 # DATABASE
@@ -73,7 +79,11 @@ settings = None
 
 
 async def init_db():
-    global mongo_client, db, videos, jobs, settings
+    global mongo_client
+    global db
+    global videos
+    global jobs
+    global settings
 
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
@@ -87,7 +97,7 @@ async def init_db():
     settings = db["settings"]
 
     # --------------------------------------------------------
-    # Indexes
+    # INDEXES
     # --------------------------------------------------------
 
     await videos.create_index(
@@ -111,6 +121,11 @@ async def init_db():
         name="created_index",
     )
 
+    await videos.create_index(
+        [("source_chat_id", ASCENDING)],
+        name="source_chat",
+    )
+
     await jobs.create_index(
         [("status", ASCENDING)],
         name="job_status",
@@ -122,7 +137,7 @@ async def init_db():
     )
 
     # --------------------------------------------------------
-    # Test MongoDB
+    # TEST CONNECTION
     # --------------------------------------------------------
 
     await db.command("ping")
@@ -144,10 +159,7 @@ async def admin_only(update: Update) -> bool:
     if not user:
         return False
 
-    if not is_admin(user.id):
-        return False
-
-    return True
+    return is_admin(user.id)
 
 
 def now():
@@ -160,41 +172,34 @@ def now():
 
 def get_video_from_message(message):
     """
-    Returns:
-        file_id,
-        file_unique_id,
-        width,
-        height,
-        duration,
-        caption
+    Extract video information.
+
+    Only Telegram VIDEO is accepted.
+    Photos, documents, animations, text and links
+    are ignored.
     """
 
     if not message:
         return None
 
-    # Normal Telegram video
-    if message.video:
-        v = message.video
+    if not message.video:
+        return None
 
-        return {
-            "file_id": v.file_id,
-            "file_unique_id": v.file_unique_id,
-            "width": v.width,
-            "height": v.height,
-            "duration": v.duration,
-            "file_size": getattr(v, "file_size", None),
-            "caption": message.caption or "",
-        }
+    video = message.video
 
-    # Telegram sometimes sends video as animation.
-    # We intentionally DO NOT save animations because
-    # user requested VIDEO only.
-
-    return None
+    return {
+        "file_id": video.file_id,
+        "file_unique_id": video.file_unique_id,
+        "width": video.width,
+        "height": video.height,
+        "duration": video.duration,
+        "file_size": getattr(video, "file_size", None),
+        "caption": message.caption or "",
+    }
 
 
 # ============================================================
-# AUTO SAVE VIDEO
+# SAVE VIDEO
 # ============================================================
 
 async def save_video_message(message):
@@ -206,32 +211,43 @@ async def save_video_message(message):
     file_unique_id = data["file_unique_id"]
 
     # --------------------------------------------------------
-    # Duplicate check
+    # DUPLICATE CHECK
     # --------------------------------------------------------
 
     existing = await videos.find_one(
-        {"file_unique_id": file_unique_id},
-        {"_id": 1, "seq": 1},
+        {
+            "file_unique_id": file_unique_id
+        },
+        {
+            "_id": 1,
+            "seq": 1,
+        },
     )
 
     if existing:
         return False, existing.get("seq")
 
     # --------------------------------------------------------
-    # Atomic sequence number
+    # ATOMIC SEQUENCE
     # --------------------------------------------------------
 
     counter = await settings.find_one_and_update(
-        {"_id": "video_counter"},
-        {"$inc": {"value": 1}},
+        {
+            "_id": "video_counter"
+        },
+        {
+            "$inc": {
+                "value": 1
+            }
+        },
         upsert=True,
-        return_document=True,
+        return_document=ReturnDocument.AFTER,
     )
 
     seq = counter["value"]
 
     # --------------------------------------------------------
-    # Source information
+    # SOURCE INFORMATION
     # --------------------------------------------------------
 
     chat = message.chat
@@ -252,6 +268,10 @@ async def save_video_message(message):
             )
             or ""
         )
+
+    # --------------------------------------------------------
+    # DOCUMENT
+    # --------------------------------------------------------
 
     document = {
         "seq": seq,
@@ -274,6 +294,7 @@ async def save_video_message(message):
     }
 
     try:
+
         await videos.insert_one(document)
 
         logger.info(
@@ -285,30 +306,32 @@ async def save_video_message(message):
         return True, seq
 
     except DuplicateKeyError:
-        # Race condition protection
+
         existing = await videos.find_one(
-            {"file_unique_id": file_unique_id},
-            {"seq": 1},
+            {
+                "file_unique_id": file_unique_id
+            },
+            {
+                "seq": 1
+            },
         )
 
-        return False, existing.get("seq") if existing else None
+        return (
+            False,
+            existing.get("seq")
+            if existing
+            else None
+        )
 
 
 # ============================================================
-# VIDEO MESSAGE HANDLER
+# VIDEO HANDLER
 # ============================================================
 
 async def video_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    Saves videos automatically from:
-    - private chats
-    - groups
-    - supergroups
-    - channels
-    """
 
     message = update.effective_message
 
@@ -319,20 +342,30 @@ async def video_handler(
         return
 
     try:
-        saved, seq = await save_video_message(message)
 
-        if saved:
-            # Only reply in private chats.
-            # Do NOT spam groups/channels.
-            if message.chat.type == ChatType.PRIVATE:
-                await message.reply_text(
-                    f"✅ Video saved\n\n"
-                    f"🆔 ID: `{seq}`",
-                    parse_mode="Markdown",
-                )
+        saved, seq = await save_video_message(
+            message
+        )
+
+        # Only reply in private chat.
+        # Never spam groups/channels.
+
+        if (
+            saved
+            and message.chat.type == ChatType.PRIVATE
+        ):
+
+            await message.reply_text(
+                f"✅ Video saved\n\n"
+                f"🆔 ID: `{seq}`",
+                parse_mode="Markdown",
+            )
 
     except Exception:
-        logger.exception("Error while saving video")
+
+        logger.exception(
+            "Error while saving video"
+        )
 
 
 # ============================================================
@@ -343,28 +376,34 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.effective_user:
         return
 
-    if not is_admin(update.effective_user.id):
+    if not is_admin(
+        update.effective_user.id
+    ):
+
         await update.effective_message.reply_text(
             "🎥 Send a video to store it."
         )
+
         return
 
     await update.effective_message.reply_text(
-        "🎥 Video Storage Bot\n\n"
+        "🎥 VIDEO STORAGE BOT\n\n"
         "Videos are saved automatically.\n\n"
         "Admin commands:\n"
         "/stats\n"
-        "/list\n"
+        "/list [limit]\n"
         "/search <text>\n"
         "/send <ID> <CHAT_ID>\n"
         "/sendall <CHAT_ID>\n"
         "/delete <ID>\n"
         "/pause\n"
         "/resume\n"
-        "/cancel"
+        "/cancel\n"
+        "/job"
     )
 
 
@@ -376,24 +415,35 @@ async def stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     total = await videos.count_documents({})
 
-    pending = await jobs.count_documents({
-        "status": {
-            "$in": ["queued", "running", "paused"]
+    pending = await jobs.count_documents(
+        {
+            "status": {
+                "$in": [
+                    "queued",
+                    "running",
+                    "paused",
+                ]
+            }
         }
-    })
+    )
 
-    completed = await jobs.count_documents({
-        "status": "completed"
-    })
+    completed = await jobs.count_documents(
+        {
+            "status": "completed"
+        }
+    )
 
-    failed = await jobs.count_documents({
-        "status": "failed"
-    })
+    failed = await jobs.count_documents(
+        {
+            "status": "failed"
+        }
+    )
 
     await update.effective_message.reply_text(
         "📊 VIDEO STORAGE\n\n"
@@ -412,42 +462,66 @@ async def list_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     limit = 20
 
     if context.args:
+
         try:
-            limit = min(int(context.args[0]), 100)
+            limit = int(
+                context.args[0]
+            )
+
+            limit = min(
+                max(limit, 1),
+                100,
+            )
+
         except ValueError:
             pass
 
-    cursor = videos.find(
-        {},
-        {
-            "seq": 1,
-            "duration": 1,
-            "source_title": 1,
-            "created_at": 1,
-        },
-    ).sort(
-        "seq",
-        DESCENDING,
-    ).limit(limit)
+    cursor = (
+        videos.find(
+            {},
+            {
+                "seq": 1,
+                "duration": 1,
+                "source_title": 1,
+                "created_at": 1,
+            },
+        )
+        .sort(
+            "seq",
+            DESCENDING,
+        )
+        .limit(limit)
+    )
 
-    items = await cursor.to_list(length=limit)
+    items = await cursor.to_list(
+        length=limit
+    )
 
     if not items:
+
         await update.effective_message.reply_text(
             "📦 Storage is empty."
         )
+
         return
 
-    lines = ["📦 LATEST VIDEOS\n"]
+    lines = [
+        "📦 LATEST VIDEOS\n"
+    ]
 
     for item in items:
-        source = item.get("source_title") or "Unknown"
+
+        source = (
+            item.get("source_title")
+            or "Unknown"
+        )
 
         lines.append(
             f"🎥 ID: {item['seq']}\n"
@@ -467,45 +541,63 @@ async def search_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     if not context.args:
+
         await update.effective_message.reply_text(
-            "Usage:\n/search keyword"
+            "Usage:\n"
+            "/search keyword"
         )
+
         return
 
-    keyword = " ".join(context.args).strip()
+    keyword = " ".join(
+        context.args
+    ).strip()
 
     regex = {
         "$regex": keyword,
         "$options": "i",
     }
 
-    cursor = videos.find(
-        {
-            "$or": [
-                {"caption": regex},
-                {"source_title": regex},
-            ]
-        },
-        {
-            "seq": 1,
-            "caption": 1,
-            "source_title": 1,
-        },
-    ).sort(
-        "seq",
-        DESCENDING,
-    ).limit(50)
+    cursor = (
+        videos.find(
+            {
+                "$or": [
+                    {
+                        "caption": regex
+                    },
+                    {
+                        "source_title": regex
+                    },
+                ]
+            },
+            {
+                "seq": 1,
+                "caption": 1,
+                "source_title": 1,
+            },
+        )
+        .sort(
+            "seq",
+            DESCENDING,
+        )
+        .limit(50)
+    )
 
-    results = await cursor.to_list(length=50)
+    results = await cursor.to_list(
+        length=50
+    )
 
     if not results:
+
         await update.effective_message.reply_text(
             "❌ No videos found."
         )
+
         return
 
     lines = [
@@ -513,8 +605,16 @@ async def search_command(
     ]
 
     for item in results:
-        caption = item.get("caption") or ""
-        source = item.get("source_title") or "Unknown"
+
+        caption = (
+            item.get("caption")
+            or ""
+        )
+
+        source = (
+            item.get("source_title")
+            or "Unknown"
+        )
 
         caption = caption[:100]
 
@@ -538,9 +638,13 @@ async def send_video(
     video_doc,
     chat_id,
 ):
+
     media = InputMediaVideo(
         media=video_doc["file_id"],
-        caption=video_doc.get("caption") or None,
+        caption=(
+            video_doc.get("caption")
+            or None
+        ),
     )
 
     await bot.send_media_group(
@@ -557,37 +661,55 @@ async def send_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     if len(context.args) < 2:
+
         await update.effective_message.reply_text(
-            "Usage:\n/send VIDEO_ID CHAT_ID\n\n"
+            "Usage:\n"
+            "/send VIDEO_ID CHAT_ID\n\n"
             "Example:\n"
             "/send 150 -1001234567890"
         )
+
         return
 
     try:
-        video_id = int(context.args[0])
-        chat_id = int(context.args[1])
+
+        video_id = int(
+            context.args[0]
+        )
+
+        chat_id = int(
+            context.args[1]
+        )
+
     except ValueError:
+
         await update.effective_message.reply_text(
             "❌ Invalid ID or Chat ID."
         )
+
         return
 
     video = await videos.find_one(
-        {"seq": video_id}
+        {
+            "seq": video_id
+        }
     )
 
     if not video:
+
         await update.effective_message.reply_text(
             "❌ Video not found."
         )
+
         return
 
     try:
+
         await send_video(
             context.bot,
             video,
@@ -598,19 +720,34 @@ async def send_command(
             f"✅ Video {video_id} sent."
         )
 
-    except Exception as e:
-        logger.exception("Send failed")
+    except RetryAfter as e:
 
         await update.effective_message.reply_text(
-            f"❌ Send failed:\n{str(e)[:1000]}"
+            "⏳ Telegram FloodWait.\n"
+            f"Please wait {int(e.retry_after)} seconds."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Send failed"
+        )
+
+        await update.effective_message.reply_text(
+            f"❌ Send failed:\n"
+            f"{str(e)[:1000]}"
         )
 
 
 # ============================================================
-# CREATE SENDALL JOB
+# CREATE SEND JOB
 # ============================================================
 
-async def create_send_job(chat_id, created_by):
+async def create_send_job(
+    chat_id,
+    created_by,
+):
+
     job = {
         "type": "sendall",
 
@@ -631,7 +768,9 @@ async def create_send_job(chat_id, created_by):
         "updated_at": now(),
     }
 
-    result = await jobs.insert_one(job)
+    result = await jobs.insert_one(
+        job
+    )
 
     return result.inserted_id
 
@@ -644,55 +783,77 @@ async def sendall_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     if not context.args:
+
         await update.effective_message.reply_text(
-            "Usage:\n/sendall CHAT_ID\n\n"
+            "Usage:\n"
+            "/sendall CHAT_ID\n\n"
             "Example:\n"
             "/sendall -1001234567890"
         )
+
         return
 
     try:
-        chat_id = int(context.args[0])
+
+        chat_id = int(
+            context.args[0]
+        )
+
     except ValueError:
+
         await update.effective_message.reply_text(
             "❌ Invalid Chat ID."
         )
+
         return
 
-    active_job = await jobs.find_one({
-        "status": {
-            "$in": ["queued", "running", "paused"]
+    active_job = await jobs.find_one(
+        {
+            "status": {
+                "$in": [
+                    "queued",
+                    "running",
+                    "paused",
+                ]
+            }
         }
-    })
+    )
 
     if active_job:
+
         await update.effective_message.reply_text(
             "⚠️ A send job is already active.\n\n"
             f"Sent: {active_job.get('sent', 0):,}\n"
             f"Failed: {active_job.get('failed', 0):,}\n"
             f"Last ID: {active_job.get('last_seq', 0):,}"
         )
+
         return
 
     total = await videos.count_documents({})
 
     if total == 0:
+
         await update.effective_message.reply_text(
             "❌ No videos in storage."
         )
+
         return
 
     job_id = await create_send_job(
         chat_id=chat_id,
-        created_by=update.effective_user.id,
+        created_by=(
+            update.effective_user.id
+        ),
     )
 
     await update.effective_message.reply_text(
-        "🚀 Send job created.\n\n"
+        "🚀 SEND JOB CREATED\n\n"
         f"🎥 Total: {total:,}\n"
         f"📤 Destination: `{chat_id}`\n\n"
         f"🆔 Job: `{str(job_id)}`",
@@ -701,20 +862,24 @@ async def sendall_command(
 
 
 # ============================================================
-# PAUSE / RESUME / CANCEL
+# /PAUSE
 # ============================================================
 
 async def pause_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     result = await jobs.update_one(
         {
             "status": {
-                "$in": ["queued", "running"]
+                "$in": [
+                    "queued",
+                    "running",
+                ]
             }
         },
         {
@@ -726,19 +891,27 @@ async def pause_command(
     )
 
     if result.modified_count:
+
         await update.effective_message.reply_text(
             "⏸️ Send job paused."
         )
+
     else:
+
         await update.effective_message.reply_text(
             "ℹ️ No active send job."
         )
 
 
+# ============================================================
+# /RESUME
+# ============================================================
+
 async def resume_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
@@ -755,26 +928,38 @@ async def resume_command(
     )
 
     if result.modified_count:
+
         await update.effective_message.reply_text(
             "▶️ Send job resumed."
         )
+
     else:
+
         await update.effective_message.reply_text(
             "ℹ️ No paused job."
         )
 
 
+# ============================================================
+# /CANCEL
+# ============================================================
+
 async def cancel_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     result = await jobs.update_one(
         {
             "status": {
-                "$in": ["queued", "running", "paused"]
+                "$in": [
+                    "queued",
+                    "running",
+                    "paused",
+                ]
             }
         },
         {
@@ -786,10 +971,13 @@ async def cancel_command(
     )
 
     if result.modified_count:
+
         await update.effective_message.reply_text(
             "❌ Send job cancelled."
         )
+
     else:
+
         await update.effective_message.reply_text(
             "ℹ️ No active job."
         )
@@ -803,32 +991,47 @@ async def delete_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     if not context.args:
+
         await update.effective_message.reply_text(
-            "Usage:\n/delete VIDEO_ID"
+            "Usage:\n"
+            "/delete VIDEO_ID"
         )
+
         return
 
     try:
-        video_id = int(context.args[0])
+
+        video_id = int(
+            context.args[0]
+        )
+
     except ValueError:
+
         await update.effective_message.reply_text(
             "❌ Invalid ID."
         )
+
         return
 
     result = await videos.delete_one(
-        {"seq": video_id}
+        {
+            "seq": video_id
+        }
     )
 
     if result.deleted_count:
+
         await update.effective_message.reply_text(
             f"🗑️ Video {video_id} deleted."
         )
+
     else:
+
         await update.effective_message.reply_text(
             "❌ Video not found."
         )
@@ -842,26 +1045,44 @@ async def job_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not await admin_only(update):
         return
 
     job = await jobs.find_one(
         {},
-        sort=[("created_at", DESCENDING)],
+        sort=[
+            (
+                "created_at",
+                DESCENDING,
+            )
+        ],
     )
 
     if not job:
+
         await update.effective_message.reply_text(
             "No jobs found."
         )
+
         return
 
     total = await videos.count_documents({})
 
-    sent = job.get("sent", 0)
-    failed = job.get("failed", 0)
+    sent = job.get(
+        "sent",
+        0,
+    )
 
-    remaining = max(total - sent - failed, 0)
+    failed = job.get(
+        "failed",
+        0,
+    )
+
+    remaining = max(
+        total - sent - failed,
+        0,
+    )
 
     await update.effective_message.reply_text(
         "📤 SEND STATUS\n\n"
@@ -870,13 +1091,15 @@ async def job_command(
         f"✅ Sent: {sent:,}\n"
         f"❌ Failed: {failed:,}\n"
         f"⏳ Remaining: {remaining:,}\n"
-        f"🔢 Last ID: {job.get('last_seq', 0):,}\n"
-        f"📍 Chat: {job.get('chat_id')}"
+        f"🔢 Last ID: "
+        f"{job.get('last_seq', 0):,}\n"
+        f"📍 Chat: "
+        f"{job.get('chat_id')}"
     )
 
 
 # ============================================================
-# FLOOD WAIT / RETRY
+# FLOODWAIT / RETRY
 # ============================================================
 
 async def send_album_with_retry(
@@ -884,26 +1107,39 @@ async def send_album_with_retry(
     chat_id,
     media,
 ):
+
     attempts = 0
 
     while attempts < MAX_RETRIES:
+
         try:
+
             return await bot.send_media_group(
                 chat_id=chat_id,
                 media=media,
             )
 
         except RetryAfter as e:
-            wait_time = int(e.retry_after) + 2
+
+            wait_time = (
+                int(e.retry_after)
+                + 2
+            )
 
             logger.warning(
                 "FloodWait: sleeping %s seconds",
                 wait_time,
             )
 
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(
+                wait_time
+            )
 
-        except (TimedOut, NetworkError):
+        except (
+            TimedOut,
+            NetworkError,
+        ):
+
             attempts += 1
 
             wait_time = min(
@@ -912,15 +1148,19 @@ async def send_album_with_retry(
             )
 
             logger.warning(
-                "Network error. Retry %s/%s in %ss",
+                "Network error. "
+                "Retry %s/%s in %ss",
                 attempts,
                 MAX_RETRIES,
                 wait_time,
             )
 
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(
+                wait_time
+            )
 
         except TelegramError:
+
             raise
 
     raise RuntimeError(
@@ -932,30 +1172,46 @@ async def send_album_with_retry(
 # SEND QUEUE WORKER
 # ============================================================
 
-async def send_queue_worker(application):
-    logger.info("Send queue worker started")
+async def send_queue_worker(
+    application,
+):
+
+    logger.info(
+        "Send queue worker started"
+    )
 
     while True:
+
         try:
-            job = await jobs.find_one_and_update(
-                {
-                    "status": "queued"
-                },
-                {
-                    "$set": {
-                        "status": "running",
-                        "updated_at": now(),
-                    }
-                },
-                sort=[("created_at", ASCENDING)],
-                return_document=True,
+
+            job = (
+                await jobs.find_one_and_update(
+                    {
+                        "status": "queued"
+                    },
+                    {
+                        "$set": {
+                            "status": "running",
+                            "updated_at": now(),
+                        }
+                    },
+                    sort=[
+                        (
+                            "created_at",
+                            ASCENDING,
+                        )
+                    ],
+                    return_document=(
+                        ReturnDocument.AFTER
+                    ),
+                )
             )
 
             if not job:
-                await asyncio.sleep(2)
-                continue
 
-            job_id = job["_id"]
+                await asyncio.sleep(2)
+
+                continue
 
             await process_send_job(
                 application,
@@ -963,10 +1219,15 @@ async def send_queue_worker(application):
             )
 
         except asyncio.CancelledError:
-            logger.info("Queue worker stopped")
+
+            logger.info(
+                "Queue worker stopped"
+            )
+
             break
 
         except Exception:
+
             logger.exception(
                 "Queue worker error"
             )
@@ -982,10 +1243,15 @@ async def process_send_job(
     application,
     job,
 ):
+
     job_id = job["_id"]
+
     chat_id = job["chat_id"]
 
-    last_seq = job.get("last_seq", 0)
+    last_seq = job.get(
+        "last_seq",
+        0,
+    )
 
     logger.info(
         "Processing send job %s",
@@ -995,51 +1261,67 @@ async def process_send_job(
     while True:
 
         # ----------------------------------------------------
-        # Get latest job status
+        # GET CURRENT JOB
         # ----------------------------------------------------
 
         current_job = await jobs.find_one(
-            {"_id": job_id}
+            {
+                "_id": job_id
+            }
         )
 
         if not current_job:
+
             return
 
-        status = current_job.get("status")
+        status = current_job.get(
+            "status"
+        )
 
         if status == "cancelled":
+
             logger.info(
                 "Job %s cancelled",
                 job_id,
             )
+
             return
 
         if status == "paused":
+
             await asyncio.sleep(3)
+
             continue
 
         # ----------------------------------------------------
-        # Get next 10 videos
+        # GET NEXT 10 VIDEOS
         # ----------------------------------------------------
 
-        cursor = videos.find(
-            {
-                "seq": {
-                    "$gt": last_seq
+        cursor = (
+            videos.find(
+                {
+                    "seq": {
+                        "$gt": last_seq
+                    }
                 }
-            }
-        ).sort(
-            "seq",
-            ASCENDING,
-        ).limit(10)
+            )
+            .sort(
+                "seq",
+                ASCENDING,
+            )
+            .limit(ALBUM_SIZE)
+        )
 
         batch = await cursor.to_list(
-            length=10
+            length=ALBUM_SIZE
         )
 
         if not batch:
+
             await jobs.update_one(
-                {"_id": job_id},
+                {
+                    "_id": job_id
+                },
                 {
                     "$set": {
                         "status": "completed",
@@ -1056,13 +1338,17 @@ async def process_send_job(
             return
 
         # ----------------------------------------------------
-        # Create Telegram album
+        # CREATE ALBUM
         # ----------------------------------------------------
 
         media = []
 
         for item in batch:
-            caption = item.get("caption") or None
+
+            caption = (
+                item.get("caption")
+                or None
+            )
 
             media.append(
                 InputMediaVideo(
@@ -1072,10 +1358,11 @@ async def process_send_job(
             )
 
         # ----------------------------------------------------
-        # Send album
+        # SEND ALBUM
         # ----------------------------------------------------
 
         try:
+
             await send_album_with_retry(
                 application.bot,
                 chat_id,
@@ -1087,7 +1374,9 @@ async def process_send_job(
             last_seq = batch[-1]["seq"]
 
             await jobs.update_one(
-                {"_id": job_id},
+                {
+                    "_id": job_id
+                },
                 {
                     "$set": {
                         "last_seq": last_seq,
@@ -1107,6 +1396,7 @@ async def process_send_job(
             )
 
         except TelegramError as e:
+
             logger.error(
                 "Album failed for job %s: %s",
                 job_id,
@@ -1114,15 +1404,15 @@ async def process_send_job(
             )
 
             # ------------------------------------------------
-            # Important:
-            # We move past the failed batch so the whole queue
-            # does not become permanently blocked.
+            # Move past failed batch
             # ------------------------------------------------
 
             last_seq = batch[-1]["seq"]
 
             await jobs.update_one(
-                {"_id": job_id},
+                {
+                    "_id": job_id
+                },
                 {
                     "$set": {
                         "last_seq": last_seq,
@@ -1135,23 +1425,31 @@ async def process_send_job(
             )
 
         # ----------------------------------------------------
-        # Safe delay between albums
+        # SAFE DELAY
         # ----------------------------------------------------
 
         await asyncio.sleep(
-            max(SEND_DELAY, 1)
+            max(
+                SEND_DELAY,
+                1,
+            )
         )
 
 
 # ============================================================
-# JOB STATUS COMMAND
+# STARTUP
 # ============================================================
 
-async def on_startup(application):
+async def on_startup(
+    application,
+):
+
     await init_db()
 
     application.create_task(
-        send_queue_worker(application)
+        send_queue_worker(
+            application
+        )
     )
 
     logger.info(
@@ -1167,10 +1465,50 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    logger.exception(
-        "Unhandled exception:",
+
+    logger.error(
+        "Unhandled exception: %s",
+        context.error,
         exc_info=context.error,
     )
+
+
+# ============================================================
+# PYTHON 3.14 EVENT LOOP FIX
+# ============================================================
+
+def run_application(
+    application,
+):
+
+    """
+    Python 3.14 compatibility.
+
+    python-telegram-bot 22.3's run_polling()
+    expects a current event loop.
+    """
+
+    loop = asyncio.new_event_loop()
+
+    asyncio.set_event_loop(
+        loop
+    )
+
+    try:
+
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES
+        )
+
+    finally:
+
+        try:
+
+            loop.close()
+
+        except Exception:
+
+            pass
 
 
 # ============================================================
@@ -1179,20 +1517,31 @@ async def error_handler(
 
 def main():
 
+    # --------------------------------------------------------
+    # ENV CHECK
+    # --------------------------------------------------------
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN environment variable missing"
         )
 
     if not MONGO_URI:
+
         raise RuntimeError(
             "MONGO_URI environment variable missing"
         )
 
     if not ADMIN_IDS:
+
         raise RuntimeError(
             "ADMIN_IDS environment variable missing"
         )
+
+    # --------------------------------------------------------
+    # APPLICATION
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
@@ -1202,7 +1551,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Commands
+    # COMMANDS
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1283,13 +1632,15 @@ def main():
     )
 
     # --------------------------------------------------------
-    # VIDEO AUTO SAVE
+    # AUTO VIDEO SAVE
     #
-    # This catches videos from:
-    # PRIVATE
-    # GROUP
-    # SUPERGROUP
-    # CHANNEL
+    # Private
+    # Group
+    # Supergroup
+    # Channel
+    #
+    # Only VIDEO messages are saved.
+    # Text / links / photos / documents are ignored.
     # --------------------------------------------------------
 
     application.add_handler(
@@ -1299,6 +1650,10 @@ def main():
         )
     )
 
+    # --------------------------------------------------------
+    # ERROR HANDLER
+    # --------------------------------------------------------
+
     application.add_error_handler(
         error_handler
     )
@@ -1307,10 +1662,18 @@ def main():
         "Starting polling..."
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    # --------------------------------------------------------
+    # PYTHON 3.14 SAFE RUN
+    # --------------------------------------------------------
+
+    run_application(
+        application
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
