@@ -1262,7 +1262,7 @@ async def send_queue_worker(
 
 
 # ============================================================
-# PROCESS SEND JOB
+# PROCESS SEND JOB — FIXED
 # ============================================================
 
 async def process_send_job(
@@ -1271,19 +1271,12 @@ async def process_send_job(
 ):
 
     job_id = job["_id"]
-
     chat_id = job["chat_id"]
 
-    last_seq = job.get(
-        "last_seq",
-        0,
-    )
-
     logger.info(
-        "PROCESSING SEND JOB | job=%s | chat=%s | last=%s",
+        "PROCESSING SEND JOB | job=%s | chat=%s",
         job_id,
         chat_id,
-        last_seq,
     )
 
     # --------------------------------------------------------
@@ -1331,6 +1324,14 @@ async def process_send_job(
 
     while True:
 
+        # ====================================================
+        # IMPORTANT FIX
+        #
+        # ALWAYS READ last_seq FROM MONGODB.
+        #
+        # The database is the single source of truth.
+        # ====================================================
+
         current_job = await jobs.find_one(
             {
                 "_id": job_id
@@ -1374,7 +1375,7 @@ async def process_send_job(
             continue
 
         # ----------------------------------------------------
-        # If failed externally
+        # FAILED
         # ----------------------------------------------------
 
         if status == "failed":
@@ -1382,7 +1383,24 @@ async def process_send_job(
             return
 
         # ----------------------------------------------------
-        # GET NEXT 10
+        # READ CURRENT LAST SEQ
+        # ----------------------------------------------------
+
+        last_seq = int(
+            current_job.get(
+                "last_seq",
+                0,
+            )
+        )
+
+        logger.info(
+            "GET NEXT BATCH | job=%s | last_seq=%s",
+            job_id,
+            last_seq,
+        )
+
+        # ----------------------------------------------------
+        # GET NEXT 10 VIDEOS
         # ----------------------------------------------------
 
         cursor = (
@@ -1412,7 +1430,8 @@ async def process_send_job(
 
             await jobs.update_one(
                 {
-                    "_id": job_id
+                    "_id": job_id,
+                    "status": "running",
                 },
                 {
                     "$set": {
@@ -1430,6 +1449,52 @@ async def process_send_job(
             )
 
             return
+
+        # ----------------------------------------------------
+        # SAFETY CHECK
+        # ----------------------------------------------------
+
+        first_id = batch[0]["seq"]
+        last_id = batch[-1]["seq"]
+
+        if first_id <= last_seq:
+
+            logger.error(
+                "PROGRESS ERROR | job=%s | "
+                "last_seq=%s | first_id=%s | last_id=%s",
+                job_id,
+                last_seq,
+                first_id,
+                last_id,
+            )
+
+            await jobs.update_one(
+                {
+                    "_id": job_id
+                },
+                {
+                    "$set": {
+                        "status": "failed",
+                        "last_error": (
+                            "SendAll progress safety check failed."
+                        ),
+                        "updated_at": now(),
+                    }
+                },
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # LOG EXACT VIDEOS BEING SENT
+        # ----------------------------------------------------
+
+        logger.info(
+            "BATCH READY | job=%s | IDs=%s-%s",
+            job_id,
+            first_id,
+            last_id,
+        )
 
         # ----------------------------------------------------
         # CREATE ALBUM
@@ -1450,9 +1515,6 @@ async def process_send_job(
                     caption=caption,
                 )
             )
-
-        first_id = batch[0]["seq"]
-        last_id = batch[-1]["seq"]
 
         logger.info(
             "SENDING ALBUM | job=%s | IDs=%s-%s | count=%s",
@@ -1476,15 +1538,24 @@ async def process_send_job(
 
             sent_count = len(batch)
 
-            last_seq = last_id
+            # =================================================
+            # ATOMIC PROGRESS UPDATE
+            #
+            # This is the main duplicate-prevention fix.
+            #
+            # Update ONLY if MongoDB still has the same
+            # last_seq that we used to create this batch.
+            # =================================================
 
-            await jobs.update_one(
+            update_result = await jobs.update_one(
                 {
-                    "_id": job_id
+                    "_id": job_id,
+                    "status": "running",
+                    "last_seq": last_seq,
                 },
                 {
                     "$set": {
-                        "last_seq": last_seq,
+                        "last_seq": last_id,
                         "updated_at": now(),
                     },
                     "$inc": {
@@ -1493,13 +1564,58 @@ async def process_send_job(
                 },
             )
 
+            # -------------------------------------------------
+            # VERIFY PROGRESS
+            # -------------------------------------------------
+
+            if update_result.modified_count != 1:
+
+                logger.error(
+                    "PROGRESS UPDATE FAILED AFTER SEND | "
+                    "job=%s | batch=%s-%s",
+                    job_id,
+                    first_id,
+                    last_id,
+                )
+
+                # IMPORTANT:
+                # Do NOT send this batch again.
+                # Stop to prevent duplicate sending.
+
+                await jobs.update_one(
+                    {
+                        "_id": job_id
+                    },
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "last_error": (
+                                "MongoDB progress update failed "
+                                "after successful send. "
+                                "Job stopped to prevent duplicates."
+                            ),
+                            "updated_at": now(),
+                        }
+                    },
+                )
+
+                return
+
             logger.info(
-                "ALBUM SENT | job=%s | count=%s | last=%s | telegram_messages=%s",
+                "ALBUM SENT SUCCESSFULLY | "
+                "job=%s | IDs=%s-%s | count=%s | "
+                "NEW_LAST_SEQ=%s | telegram_messages=%s",
                 job_id,
+                first_id,
+                last_id,
                 sent_count,
-                last_seq,
+                last_id,
                 len(result) if result else 0,
             )
+
+        # ----------------------------------------------------
+        # FLOODWAIT
+        # ----------------------------------------------------
 
         except RetryAfter as e:
 
@@ -1508,7 +1624,9 @@ async def process_send_job(
             ) + 2
 
             logger.warning(
-                "FLOODWAIT DURING JOB | %s seconds",
+                "FLOODWAIT DURING JOB | "
+                "job=%s | wait=%ss",
+                job_id,
                 wait_time,
             )
 
@@ -1516,32 +1634,36 @@ async def process_send_job(
                 wait_time
             )
 
+            # last_seq is intentionally unchanged.
+            # The batch can be attempted again.
+
             continue
+
+        # ----------------------------------------------------
+        # TELEGRAM ERROR
+        # ----------------------------------------------------
 
         except TelegramError as e:
 
             logger.exception(
-                "TELEGRAM ERROR | job=%s | IDs=%s-%s",
+                "TELEGRAM ERROR | "
+                "job=%s | IDs=%s-%s",
                 job_id,
                 first_id,
                 last_id,
             )
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Do not keep retrying permanent errors forever.
-            # Move past this batch.
-            # ------------------------------------------------
-
-            last_seq = last_id
+            # Move past a permanent Telegram error.
 
             await jobs.update_one(
                 {
-                    "_id": job_id
+                    "_id": job_id,
+                    "status": "running",
+                    "last_seq": last_seq,
                 },
                 {
                     "$set": {
-                        "last_seq": last_seq,
+                        "last_seq": last_id,
                         "updated_at": now(),
                         "last_error": str(e)[:2000],
                     },
@@ -1551,22 +1673,29 @@ async def process_send_job(
                 },
             )
 
+        # ----------------------------------------------------
+        # UNKNOWN ERROR
+        # ----------------------------------------------------
+
         except Exception as e:
 
             logger.exception(
-                "UNKNOWN SEND ERROR | job=%s",
+                "UNKNOWN SEND ERROR | "
+                "job=%s | IDs=%s-%s",
                 job_id,
+                first_id,
+                last_id,
             )
-
-            last_seq = last_id
 
             await jobs.update_one(
                 {
-                    "_id": job_id
+                    "_id": job_id,
+                    "status": "running",
+                    "last_seq": last_seq,
                 },
                 {
                     "$set": {
-                        "last_seq": last_seq,
+                        "last_seq": last_id,
                         "updated_at": now(),
                         "last_error": str(e)[:2000],
                     },
@@ -1815,9 +1944,7 @@ async def async_main():
     #
     # NO run_polling()
     #
-    # This fixes Python 3.14:
-    # RuntimeError:
-    # There is no current event loop
+    # Python 3.14 compatible.
     # ========================================================
 
     await application.initialize()
@@ -1951,9 +2078,6 @@ def main():
 
     # --------------------------------------------------------
     # PYTHON 3.14
-    #
-    # asyncio.run() creates and manages the event loop.
-    # We do NOT use application.run_polling().
     # --------------------------------------------------------
 
     asyncio.run(
