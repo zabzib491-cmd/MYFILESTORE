@@ -322,20 +322,20 @@ async def release_instance_lock():
 
 async def mark_stale_jobs_uncertain():
     """
-    Never automatically resend an interrupted batch.
+    Detect jobs left running by a previous bot instance.
 
-    If a previous process died while sending an album,
-    Telegram may already have accepted it.
+    IMPORTANT:
+    If an active batch existed when the previous process stopped,
+    preserve that batch as uncertain_batch.
 
-    Therefore:
-        running -> uncertain
-
-    This prevents duplicate albums after restart.
+    This allows /recover to safely decide whether to:
+        - resend the interrupted batch
+        - or skip it and continue from the next video
     """
 
     now = utc_now()
 
-    result = await jobs_col.update_many(
+    cursor = jobs_col.find(
         {
             "status": "running",
             "$or": [
@@ -350,23 +350,58 @@ async def mark_stale_jobs_uncertain():
                     }
                 },
             ],
-        },
-        {
-            "$set": {
-                "status": "uncertain",
-                "uncertain_reason": (
-                    "Previous worker stopped during an active batch. "
-                    "Album delivery status is unknown."
-                ),
-                "updated_at": now,
-            }
-        },
+        }
     )
 
-    if result.modified_count:
+    count = 0
+
+    async for job in cursor:
+
+        current_batch = job.get(
+            "current_batch"
+        )
+
+        update_data = {
+            "status": "uncertain",
+
+            "uncertain_reason": (
+                "Previous worker stopped during an active batch. "
+                "Album delivery status is unknown."
+            ),
+
+            "updated_at": now,
+        }
+
+        # Preserve the active batch
+        if current_batch:
+            update_data["uncertain_batch"] = {
+                "first_seq": int(
+                    current_batch["first_seq"]
+                ),
+                "last_seq": int(
+                    current_batch["last_seq"]
+                ),
+                "count": int(
+                    current_batch["count"]
+                ),
+            }
+
+        await jobs_col.update_one(
+            {
+                "_id": job["_id"],
+                "status": "running",
+            },
+            {
+                "$set": update_data
+            },
+        )
+
+        count += 1
+
+    if count:
         logger.warning(
             "Marked %s stale job(s) as uncertain.",
-            result.modified_count,
+            count,
         )
 
 
