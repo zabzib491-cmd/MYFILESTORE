@@ -1988,14 +1988,14 @@ async def main():
     acquired = await acquire_instance_lock()
 
     if not acquired:
-        logger.error(
-            "Another bot instance is already running. "
-            "Stopping this instance."
-        )
+    logger.error(
+        "Another bot instance is already running. "
+        "Stopping this instance."
+    )
 
-        await mongo.close()
+    mongo.close()
 
-        return
+    return
 
     logger.info(
         "Instance lock acquired: %s",
