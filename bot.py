@@ -39,13 +39,10 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
 
 ALBUM_SIZE = 10
 
-# How long this instance owns the polling lock
 LOCK_TTL_SECONDS = 90
 
-# Heartbeat interval
 HEARTBEAT_SECONDS = 25
 
-# Job lease
 JOB_LEASE_SECONDS = 180
 
 
@@ -124,14 +121,10 @@ async def ensure_index_by_keys(
     name=None,
 ):
     """
-    Create an index only when an equivalent index does not already exist.
+    Create an index only when an equivalent index does not
+    already exist.
 
-    IMPORTANT:
-    This prevents:
-        IndexOptionsConflict
-        Index already exists with a different name
-
-    Existing indexes such as "unique_file" are preserved.
+    Existing indexes are preserved.
     """
 
     existing = await collection.index_information()
@@ -148,8 +141,8 @@ async def ensure_index_by_keys(
                 return index_name
 
             raise RuntimeError(
-                f"Index exists with same keys but different unique option: "
-                f"{index_name}"
+                f"Index exists with same keys but different "
+                f"unique option: {index_name}"
             )
 
     kwargs = {
@@ -168,7 +161,6 @@ async def ensure_index_by_keys(
 async def ensure_indexes():
     logger.info("Checking MongoDB indexes...")
 
-    # DO NOT rename/drop existing unique_file index.
     await ensure_index_by_keys(
         videos_col,
         [("file_unique_id", ASCENDING)],
@@ -229,7 +221,7 @@ async def acquire_instance_lock():
     """
     Allow only one polling instance.
 
-    This prevents:
+    Prevents:
         Conflict: terminated by other getUpdates request
     """
 
@@ -270,10 +262,14 @@ async def acquire_instance_lock():
 async def heartbeat_loop():
     while True:
         try:
-            await asyncio.sleep(HEARTBEAT_SECONDS)
+            await asyncio.sleep(
+                HEARTBEAT_SECONDS
+            )
 
             now = utc_now()
-            expires = utc_plus(LOCK_TTL_SECONDS)
+            expires = utc_plus(
+                LOCK_TTL_SECONDS
+            )
 
             result = await settings_col.update_one(
                 {
@@ -310,6 +306,7 @@ async def release_instance_lock():
                 "instance_id": INSTANCE_ID,
             }
         )
+
     except Exception:
         logger.exception(
             "Failed to release instance lock"
@@ -324,9 +321,8 @@ async def mark_stale_jobs_uncertain():
     """
     Detect jobs left running by a previous bot instance.
 
-    IMPORTANT:
-    If an active batch existed when the previous process stopped,
-    preserve that batch as uncertain_batch.
+    If an active batch existed when the previous process
+    stopped, preserve that batch as uncertain_batch.
 
     This allows /recover to safely decide whether to:
         - resend the interrupted batch
@@ -434,7 +430,6 @@ async def save_video_message(message):
 
     file_unique_id = video.file_unique_id
 
-    # Existing duplicate check
     existing = await videos_col.find_one(
         {
             "file_unique_id": file_unique_id,
@@ -450,6 +445,7 @@ async def save_video_message(message):
             "Duplicate video ignored: %s",
             file_unique_id,
         )
+
         return existing.get("seq")
 
     seq = await get_next_seq()
@@ -475,7 +471,9 @@ async def save_video_message(message):
     }
 
     try:
-        await videos_col.insert_one(document)
+        await videos_col.insert_one(
+            document
+        )
 
         logger.info(
             "Saved video #%s",
@@ -485,7 +483,7 @@ async def save_video_message(message):
         return seq
 
     except DuplicateKeyError:
-        # Another worker/process inserted the same video.
+
         existing = await videos_col.find_one(
             {
                 "file_unique_id": file_unique_id,
@@ -538,10 +536,16 @@ async def cmd_stats(
 
     last = await videos_col.find_one(
         {},
-        sort=[("seq", DESCENDING)],
+        sort=[
+            ("seq", DESCENDING)
+        ],
     )
 
-    last_seq = last.get("seq", 0) if last else 0
+    last_seq = (
+        last.get("seq", 0)
+        if last
+        else 0
+    )
 
     await update.message.reply_text(
         "📊 VIDEO STORAGE STATS\n\n"
@@ -563,32 +567,48 @@ async def cmd_list(
 
         if context.args:
             try:
-                limit = int(context.args[0])
+                limit = int(
+                    context.args[0]
+                )
             except ValueError:
                 limit = 20
 
-        limit = max(1, min(limit, 100))
+        limit = max(
+            1,
+            min(limit, 100)
+        )
 
-        cursor = videos_col.find(
-            {},
-            {
-                "_id": 0,
-                "seq": 1,
-                "caption": 1,
-                "file_unique_id": 1,
-            },
-        ).sort(
-            "seq",
-            ASCENDING,
-        ).limit(limit)
+        cursor = (
+            videos_col
+            .find(
+                {},
+                {
+                    "_id": 0,
+                    "seq": 1,
+                    "caption": 1,
+                    "file_unique_id": 1,
+                },
+            )
+            .sort(
+                "seq",
+                ASCENDING,
+            )
+            .limit(limit)
+        )
 
         rows = []
 
         async for video in cursor:
-            caption = video.get("caption") or ""
+            caption = (
+                video.get("caption")
+                or ""
+            )
 
             if len(caption) > 50:
-                caption = caption[:50] + "..."
+                caption = (
+                    caption[:50]
+                    + "..."
+                )
 
             rows.append(
                 f"#{video.get('seq')} "
@@ -602,12 +622,14 @@ async def cmd_list(
             return
 
         await update.message.reply_text(
-            "🎬 VIDEO LIST\n\n" +
-            "\n".join(rows)
+            "🎬 VIDEO LIST\n\n"
+            + "\n".join(rows)
         )
 
     except Exception:
-        logger.exception("List failed")
+        logger.exception(
+            "List failed"
+        )
 
         await update.message.reply_text(
             "❌ Failed to list videos."
@@ -628,45 +650,59 @@ async def cmd_search(
         )
         return
 
-    text = " ".join(context.args)
+    text = " ".join(
+        context.args
+    )
 
-    cursor = videos_col.find(
-        {
-            "$or": [
-                {
-                    "caption": {
-                        "$regex": text,
-                        "$options": "i",
-                    }
-                },
-                {
-                    "file_unique_id": {
-                        "$regex": text,
-                        "$options": "i",
-                    }
-                },
-            ]
-        },
-        {
-            "_id": 0,
-            "seq": 1,
-            "caption": 1,
-        },
-    ).sort(
-        "seq",
-        ASCENDING,
-    ).limit(50)
+    cursor = (
+        videos_col
+        .find(
+            {
+                "$or": [
+                    {
+                        "caption": {
+                            "$regex": text,
+                            "$options": "i",
+                        }
+                    },
+                    {
+                        "file_unique_id": {
+                            "$regex": text,
+                            "$options": "i",
+                        }
+                    },
+                ]
+            },
+            {
+                "_id": 0,
+                "seq": 1,
+                "caption": 1,
+            },
+        )
+        .sort(
+            "seq",
+            ASCENDING,
+        )
+        .limit(50)
+    )
 
     rows = []
 
     async for video in cursor:
-        caption = video.get("caption") or ""
+        caption = (
+            video.get("caption")
+            or ""
+        )
 
         if len(caption) > 80:
-            caption = caption[:80] + "..."
+            caption = (
+                caption[:80]
+                + "..."
+            )
 
         rows.append(
-            f"#{video.get('seq')} {caption}"
+            f"#{video.get('seq')} "
+            f"{caption}"
         )
 
     if not rows:
@@ -676,8 +712,8 @@ async def cmd_search(
         return
 
     await update.message.reply_text(
-        "🔎 SEARCH RESULTS\n\n" +
-        "\n".join(rows)
+        "🔎 SEARCH RESULTS\n\n"
+        + "\n".join(rows)
     )
 
 
@@ -696,8 +732,13 @@ async def cmd_send(
         return
 
     try:
-        seq = int(context.args[0])
-        chat_id = int(context.args[1])
+        seq = int(
+            context.args[0]
+        )
+
+        chat_id = int(
+            context.args[1]
+        )
 
     except ValueError:
         await update.message.reply_text(
@@ -721,7 +762,10 @@ async def cmd_send(
         await context.bot.send_video(
             chat_id=chat_id,
             video=video["file_id"],
-            caption=video.get("caption") or None,
+            caption=(
+                video.get("caption")
+                or None
+            ),
             read_timeout=180,
             write_timeout=180,
             connect_timeout=30,
@@ -738,7 +782,8 @@ async def cmd_send(
         )
 
         await update.message.reply_text(
-            f"❌ Send failed:\n{type(e).__name__}"
+            f"❌ Send failed:\n"
+            f"{type(e).__name__}"
         )
 
 
@@ -778,15 +823,25 @@ async def get_next_batch(last_seq):
 # CLAIM BATCH
 # ============================================================
 
-async def claim_batch(job_id, batch):
+async def claim_batch(
+    job_id,
+    batch,
+):
     if not batch:
         return False
 
-    first_seq = int(batch[0]["seq"])
-    last_batch_seq = int(batch[-1]["seq"])
+    first_seq = int(
+        batch[0]["seq"]
+    )
+
+    last_batch_seq = int(
+        batch[-1]["seq"]
+    )
 
     now = utc_now()
-    lease = utc_plus(JOB_LEASE_SECONDS)
+    lease = utc_plus(
+        JOB_LEASE_SECONDS
+    )
 
     result = await jobs_col.update_one(
         {
@@ -801,6 +856,7 @@ async def claim_batch(job_id, batch):
                     "last_seq": last_batch_seq,
                     "count": len(batch),
                 },
+
                 "batch_first_seq": first_seq,
                 "batch_last_seq": last_batch_seq,
                 "batch_count": len(batch),
@@ -828,21 +884,18 @@ async def send_album_once(
     """
     Sends exactly one album.
 
-    IMPORTANT:
-    TimedOut / NetworkError is NOT automatically retried.
-
-    Why?
-
-    Telegram may have received the album even though
-    Render did not receive the response.
-
-    Retrying blindly can create duplicate albums.
+    TimedOut / NetworkError is NOT automatically retried
+    because Telegram may already have received the album.
     """
 
     media = []
 
     for video in batch:
-        caption = video.get("caption") or None
+
+        caption = (
+            video.get("caption")
+            or None
+        )
 
         media.append(
             InputMediaVideo(
@@ -854,12 +907,12 @@ async def send_album_once(
     retry_count = 0
 
     while True:
+
         try:
             await bot.send_media_group(
                 chat_id=chat_id,
                 media=media,
 
-                # Increased HTTP timeouts
                 connect_timeout=30,
                 read_timeout=180,
                 write_timeout=180,
@@ -869,15 +922,19 @@ async def send_album_once(
             return "sent"
 
         except RetryAfter as e:
+
             retry_count += 1
 
             if retry_count > MAX_RETRIES:
                 raise
 
-            retry_after = float(e.retry_after)
+            retry_after = float(
+                e.retry_after
+            )
 
             logger.warning(
-                "Telegram rate limit. Waiting %.2fs",
+                "Telegram rate limit. "
+                "Waiting %.2fs",
                 retry_after,
             )
 
@@ -885,19 +942,21 @@ async def send_album_once(
                 retry_after + 1
             )
 
-            # RetryAfter is safe to retry because
-            # Telegram explicitly rejected/throttled
-            # the request.
+        except (
+            TimedOut,
+            NetworkError,
+        ) as e:
 
-        except (TimedOut, NetworkError) as e:
             logger.error(
-                "Network timeout/error during album send: %s",
+                "Network timeout/error during "
+                "album send: %s",
                 e,
             )
 
             return "uncertain"
 
         except TelegramError:
+
             logger.exception(
                 "Telegram rejected album"
             )
@@ -905,6 +964,7 @@ async def send_album_once(
             return "failed"
 
         except Exception:
+
             logger.exception(
                 "Unexpected album error"
             )
@@ -953,6 +1013,7 @@ async def commit_batch(
                     JOB_LEASE_SECONDS
                 ),
             },
+
             "$inc": {
                 "sent": 1,
             },
@@ -974,8 +1035,13 @@ async def mark_job_uncertain(
     if not batch:
         return
 
-    first_seq = int(batch[0]["seq"])
-    last_seq = int(batch[-1]["seq"])
+    first_seq = int(
+        batch[0]["seq"]
+    )
+
+    last_seq = int(
+        batch[-1]["seq"]
+    )
 
     await jobs_col.update_one(
         {
@@ -1007,7 +1073,9 @@ async def mark_job_uncertain(
 async def process_job(job):
     job_id = job["_id"]
 
-    chat_id = int(job["chat_id"])
+    chat_id = int(
+        job["chat_id"]
+    )
 
     logger.info(
         "Starting job %s for chat %s",
@@ -1016,6 +1084,7 @@ async def process_job(job):
     )
 
     while True:
+
         current = await jobs_col.find_one(
             {
                 "_id": job_id,
@@ -1026,7 +1095,9 @@ async def process_job(job):
         if not current:
             return
 
-        status = current.get("status")
+        status = current.get(
+            "status"
+        )
 
         if status == "cancelled":
             logger.info(
@@ -1061,6 +1132,7 @@ async def process_job(job):
         )
 
         if not batch:
+
             await jobs_col.update_one(
                 {
                     "_id": job_id,
@@ -1084,7 +1156,6 @@ async def process_job(job):
 
             return
 
-        # Claim current batch
         claimed = await claim_batch(
             job_id,
             batch,
@@ -1123,22 +1194,21 @@ async def process_job(job):
             )
 
             if not committed:
-                # Album definitely succeeded,
-                # but database progress could not be committed.
-                #
-                # DO NOT resend.
+
                 await mark_job_uncertain(
                     job_id,
                     batch,
                     (
                         "Album was sent successfully, "
                         "but progress commit failed. "
-                        "Do not resend until recovery is confirmed."
+                        "Do not resend until recovery "
+                        "is confirmed."
                     ),
                 )
 
                 logger.error(
-                    "Job %s commit failed after successful send.",
+                    "Job %s commit failed after "
+                    "successful send.",
                     job_id,
                 )
 
@@ -1164,9 +1234,11 @@ async def process_job(job):
                 job_id,
                 batch,
                 (
-                    "Network timeout/error after sending attempt. "
+                    "Network timeout/error after "
+                    "sending attempt. "
                     "Album status is uncertain. "
-                    "Automatic retry disabled to prevent duplicates."
+                    "Automatic retry disabled to "
+                    "prevent duplicates."
                 ),
             )
 
@@ -1183,6 +1255,7 @@ async def process_job(job):
                     "$inc": {
                         "failed": 1,
                     },
+
                     "$set": {
                         "status": "failed",
                         "updated_at": utc_now(),
@@ -1203,8 +1276,8 @@ async def queue_worker():
     )
 
     while True:
+
         try:
-            # Find a queued job
             now = utc_now()
 
             job = await jobs_col.find_one_and_update(
@@ -1229,7 +1302,11 @@ async def queue_worker():
             )
 
             if not job:
-                await asyncio.sleep(1)
+
+                await asyncio.sleep(
+                    1
+                )
+
                 continue
 
             logger.info(
@@ -1245,11 +1322,14 @@ async def queue_worker():
             break
 
         except Exception:
+
             logger.exception(
                 "Queue worker error"
             )
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(
+                3
+            )
 
 
 # ============================================================
@@ -1261,25 +1341,30 @@ async def cmd_sendall(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     if not context.args:
+
         await update.message.reply_text(
             "Usage:\n/sendall CHAT_ID"
         )
+
         return
 
     try:
         chat_id = int(
             context.args[0]
         )
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ Invalid CHAT_ID."
         )
+
         return
 
-    # Prevent multiple simultaneous sendall jobs
     active = await jobs_col.find_one(
         {
             "chat_id": chat_id,
+
             "status": {
                 "$in": [
                     "queued",
@@ -1289,6 +1374,7 @@ async def cmd_sendall(
                 ]
             },
         },
+
         {
             "_id": 1,
             "status": 1,
@@ -1296,12 +1382,15 @@ async def cmd_sendall(
     )
 
     if active:
+
         await update.message.reply_text(
-            "⚠️ This chat already has an active job.\n\n"
+            "⚠️ This chat already has "
+            "an active job.\n\n"
             f"Job: {active['_id']}\n"
             f"Status: {active['status']}\n\n"
             "Use /job to check it."
         )
+
         return
 
     first = await videos_col.find_one(
@@ -1315,9 +1404,11 @@ async def cmd_sendall(
     )
 
     if not first:
+
         await update.message.reply_text(
             "❌ No videos stored."
         )
+
         return
 
     job_id = uuid.uuid4().hex
@@ -1359,7 +1450,8 @@ async def cmd_sendall(
         "🚀 SENDALL JOB CREATED\n\n"
         f"Job: {job_id}\n"
         f"Chat: {chat_id}\n"
-        f"Videos snapshot: {job['snapshot']:,}\n\n"
+        f"Videos snapshot: "
+        f"{job['snapshot']:,}\n\n"
         "10 videos per album.\n"
         "Use /job to monitor."
     )
@@ -1376,6 +1468,7 @@ async def cmd_job(
     job = None
 
     if context.args:
+
         job = await jobs_col.find_one(
             {
                 "_id": context.args[0]
@@ -1383,6 +1476,7 @@ async def cmd_job(
         )
 
     else:
+
         job = await jobs_col.find_one(
             {},
             sort=[
@@ -1391,9 +1485,11 @@ async def cmd_job(
         )
 
     if not job:
+
         await update.message.reply_text(
             "No jobs found."
         )
+
         return
 
     text = (
@@ -1413,11 +1509,15 @@ async def cmd_job(
     )
 
     if current_batch:
+
         text += (
             "\nCURRENT BATCH\n"
-            f"From: {current_batch.get('first_seq')}\n"
-            f"To: {current_batch.get('last_seq')}\n"
-            f"Count: {current_batch.get('count')}\n"
+            f"From: "
+            f"{current_batch.get('first_seq')}\n"
+            f"To: "
+            f"{current_batch.get('last_seq')}\n"
+            f"Count: "
+            f"{current_batch.get('count')}\n"
         )
 
     uncertain = job.get(
@@ -1425,12 +1525,17 @@ async def cmd_job(
     )
 
     if uncertain:
+
         text += (
             "\n⚠️ UNCERTAIN BATCH\n"
-            f"From: {uncertain.get('first_seq')}\n"
-            f"To: {uncertain.get('last_seq')}\n"
-            f"Count: {uncertain.get('count')}\n"
-            f"Reason: {job.get('uncertain_reason')}\n"
+            f"From: "
+            f"{uncertain.get('first_seq')}\n"
+            f"To: "
+            f"{uncertain.get('last_seq')}\n"
+            f"Count: "
+            f"{uncertain.get('count')}\n"
+            f"Reason: "
+            f"{job.get('uncertain_reason')}\n"
         )
 
     await update.message.reply_text(
@@ -1456,9 +1561,11 @@ async def cmd_pause(
     )
 
     if not job:
+
         await update.message.reply_text(
             "No running job."
         )
+
         return
 
     await jobs_col.update_one(
@@ -1475,7 +1582,7 @@ async def cmd_pause(
     )
 
     await update.message.reply_text(
-        f"⏸ Job paused.\n\n"
+        "⏸ Job paused.\n\n"
         f"Job: {job['_id']}"
     )
 
@@ -1498,9 +1605,11 @@ async def cmd_resume(
     )
 
     if not job:
+
         await update.message.reply_text(
             "No paused job found."
         )
+
         return
 
     await jobs_col.update_one(
@@ -1518,7 +1627,7 @@ async def cmd_resume(
     )
 
     await update.message.reply_text(
-        f"▶️ Job resumed.\n\n"
+        "▶️ Job resumed.\n\n"
         f"Job: {job['_id']}"
     )
 
@@ -1534,12 +1643,15 @@ async def cmd_cancel(
     job = None
 
     if context.args:
+
         job = await jobs_col.find_one(
             {
                 "_id": context.args[0]
             }
         )
+
     else:
+
         job = await jobs_col.find_one(
             {
                 "status": {
@@ -1557,14 +1669,17 @@ async def cmd_cancel(
         )
 
     if not job:
+
         await update.message.reply_text(
             "No active job found."
         )
+
         return
 
     await jobs_col.update_one(
         {
             "_id": job["_id"],
+
             "status": {
                 "$in": [
                     "queued",
@@ -1583,7 +1698,7 @@ async def cmd_cancel(
     )
 
     await update.message.reply_text(
-        f"🛑 Job cancelled.\n\n"
+        "🛑 Job cancelled.\n\n"
         f"Job: {job['_id']}"
     )
 
@@ -1605,23 +1720,15 @@ async def cmd_recover(
         First uncertain batch was NOT sent.
         Start it again.
 
-    Example:
-        uncertain batch = 1-10
-
-        /recover JOB_ID 0
-
-    -> next batch = 1-10
-
-
     /recover JOB_ID 10
 
     Means:
         1-10 were definitely sent.
-
-    -> next batch = 11-20
+        Continue from 11.
     """
 
     if len(context.args) < 2:
+
         await update.message.reply_text(
             "Usage:\n\n"
             "/recover JOB_ID SENT_LAST_SEQ\n\n"
@@ -1629,18 +1736,23 @@ async def cmd_recover(
             "/recover JOB_ID 0\n"
             "/recover JOB_ID 10"
         )
+
         return
 
     job_id = context.args[0]
 
     try:
+
         confirmed_last_seq = int(
             context.args[1]
         )
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ SENT_LAST_SEQ must be a number."
         )
+
         return
 
     job = await jobs_col.find_one(
@@ -1650,16 +1762,21 @@ async def cmd_recover(
     )
 
     if not job:
+
         await update.message.reply_text(
             "❌ Job not found."
         )
+
         return
 
     if job.get("status") != "uncertain":
+
         await update.message.reply_text(
             "❌ Job is not uncertain.\n\n"
-            f"Current status: {job.get('status')}"
+            f"Current status: "
+            f"{job.get('status')}"
         )
+
         return
 
     uncertain = job.get(
@@ -1667,9 +1784,12 @@ async def cmd_recover(
     )
 
     if not uncertain:
+
         await update.message.reply_text(
-            "❌ No uncertain batch information found."
+            "❌ No uncertain batch "
+            "information found."
         )
+
         return
 
     first_seq = int(
@@ -1681,33 +1801,40 @@ async def cmd_recover(
     )
 
     if confirmed_last_seq < first_seq - 1:
+
         await update.message.reply_text(
             "❌ Invalid recovery value.\n\n"
             f"Allowed:\n"
-            f"{first_seq - 1} = batch NOT sent\n"
-            f"{last_seq} = batch definitely sent"
+            f"{first_seq - 1} = "
+            "batch NOT sent\n"
+            f"{last_seq} = "
+            "batch definitely sent"
         )
+
         return
 
     if confirmed_last_seq > last_seq:
+
         await update.message.reply_text(
             "❌ Recovery value cannot exceed "
             "the uncertain batch's last ID."
         )
+
         return
 
-    # For a 10-video batch, only these two states
-    # make sense.
     if confirmed_last_seq not in (
         first_seq - 1,
         last_seq,
     ):
+
         await update.message.reply_text(
-            "❌ For safety, you can only recover to:\n\n"
+            "❌ For safety, you can only "
+            "recover to:\n\n"
             f"{first_seq - 1}\n"
-            f"or\n"
+            "or\n"
             f"{last_seq}"
         )
+
         return
 
     await jobs_col.update_one(
@@ -1738,16 +1865,21 @@ async def cmd_recover(
     )
 
     if confirmed_last_seq == first_seq - 1:
+
         message = (
-            f"▶️ Recovery complete.\n\n"
+            "▶️ Recovery complete.\n\n"
             f"Job: {job_id}\n"
-            f"Will resend: {first_seq}-{last_seq}"
+            f"Will resend: "
+            f"{first_seq}-{last_seq}"
         )
+
     else:
+
         message = (
-            f"▶️ Recovery complete.\n\n"
+            "▶️ Recovery complete.\n\n"
             f"Job: {job_id}\n"
-            f"Confirmed sent: {first_seq}-{last_seq}\n"
+            f"Confirmed sent: "
+            f"{first_seq}-{last_seq}\n"
             f"Next: {last_seq + 1}"
         )
 
@@ -1765,19 +1897,25 @@ async def cmd_delete(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     if not context.args:
+
         await update.message.reply_text(
             "Usage:\n/delete VIDEO_ID"
         )
+
         return
 
     try:
+
         seq = int(
             context.args[0]
         )
+
     except ValueError:
+
         await update.message.reply_text(
             "❌ Invalid video ID."
         )
+
         return
 
     result = await videos_col.delete_one(
@@ -1787,10 +1925,13 @@ async def cmd_delete(
     )
 
     if result.deleted_count:
+
         await update.message.reply_text(
             f"🗑 Video #{seq} deleted."
         )
+
     else:
+
         await update.message.reply_text(
             f"❌ Video #{seq} not found."
         )
@@ -1846,8 +1987,6 @@ application = None
 def build_application():
     global application
 
-    # IMPORTANT:
-    # Larger timeouts for large/slow media-group operations.
     request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=180,
@@ -1862,7 +2001,6 @@ def build_application():
         .build()
     )
 
-    # Commands
     application.add_handler(
         CommandHandler(
             "start",
@@ -1947,7 +2085,6 @@ def build_application():
         )
     )
 
-    # Auto-save videos
     application.add_handler(
         MessageHandler(
             filters.VIDEO,
@@ -1987,21 +2124,27 @@ async def main():
     # Only one Render worker should own polling.
     acquired = await acquire_instance_lock()
 
+    # ========================================================
+    # FIXED INDENTATION
+    # FIXED mongo.close()
+    # ========================================================
+
     if not acquired:
-    logger.error(
-        "Another bot instance is already running. "
-        "Stopping this instance."
-    )
+        logger.error(
+            "Another bot instance is already running. "
+            "Stopping this instance."
+        )
 
-    mongo.close()
+        mongo.close()
 
-    return
+        return
 
     logger.info(
         "Instance lock acquired: %s",
         INSTANCE_ID,
     )
 
+    # Recover stale running jobs
     await mark_stale_jobs_uncertain()
 
     build_application()
@@ -2015,6 +2158,7 @@ async def main():
     )
 
     try:
+
         await application.initialize()
 
         # Keep pending updates.
@@ -2037,11 +2181,13 @@ async def main():
         await asyncio.Event().wait()
 
     except asyncio.CancelledError:
+
         logger.info(
             "Main task cancelled."
         )
 
     except Exception:
+
         logger.exception(
             "Fatal application error"
         )
@@ -2053,41 +2199,57 @@ async def main():
         )
 
         if heartbeat_task:
+
             heartbeat_task.cancel()
 
             try:
                 await heartbeat_task
+
             except asyncio.CancelledError:
                 pass
 
         if worker_task:
+
             worker_task.cancel()
 
             try:
                 await worker_task
+
             except asyncio.CancelledError:
                 pass
 
         try:
+
             if application and application.updater:
+
                 await application.updater.stop()
+
         except Exception:
+
             logger.exception(
                 "Updater stop error"
             )
 
         try:
+
             if application:
+
                 await application.stop()
+
         except Exception:
+
             logger.exception(
                 "Application stop error"
             )
 
         try:
+
             if application:
+
                 await application.shutdown()
+
         except Exception:
+
             logger.exception(
                 "Application shutdown error"
             )
