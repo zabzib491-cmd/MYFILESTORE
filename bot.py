@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
@@ -37,12 +37,17 @@ LOCK_TTL_SECONDS = 90
 HEARTBEAT_SECONDS = 25
 JOB_LEASE_SECONDS = 180
 
-# New scan settings. These do not change existing storage settings.
+# Personal Telegram account used for scanning.
 API_ID = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 SCAN_DELAY = float(os.getenv("SCAN_DELAY", "0.5"))
-SCAN_PROGRESS_EVERY = int(os.getenv("SCAN_PROGRESS_EVERY", "100"))
+
+# Scan reports are sent to this Telegram group, not to the bot's private chat.
+SCAN_LOG_GROUP_ID = os.getenv("SCAN_LOG_GROUP_ID", "").strip()
+SCAN_REPORT_INTERVAL_SECONDS = max(
+    30, int(os.getenv("SCAN_REPORT_INTERVAL_SECONDS", "150"))
+)
 
 
 # ============================================================
@@ -84,7 +89,7 @@ videos_col = db["videos"]
 jobs_col = db["jobs"]
 settings_col = db["settings"]
 
-# New collection only for scan checkpoints.
+# Checkpoints and scan counters are kept separately from the existing video data.
 scan_states_col = db["scan_states"]
 
 
@@ -105,6 +110,7 @@ telethon_bot_username = None
 scan_groups_cache = []
 active_scan_task = None
 active_scan_group_id = None
+active_scan_state_id = None
 
 
 # ============================================================
@@ -284,7 +290,7 @@ async def mark_stale_jobs_uncertain():
 
 
 # ============================================================
-# VIDEO STORAGE - ORIGINAL STORAGE LOGIC
+# VIDEO STORAGE - ORIGINAL STORAGE LOGIC + SCAN COUNTERS
 # ============================================================
 
 async def get_next_seq():
@@ -312,7 +318,7 @@ async def save_video_message(message):
     )
     if existing:
         logger.info("Duplicate video ignored: %s", file_unique_id)
-        return existing.get("seq")
+        return {"seq": existing.get("seq"), "status": "duplicate"}
 
     seq = await get_next_seq()
     document = {
@@ -332,34 +338,151 @@ async def save_video_message(message):
     try:
         await videos_col.insert_one(document)
         logger.info("Saved video #%s", seq)
-        return seq
+        return {"seq": seq, "status": "stored"}
     except DuplicateKeyError:
         existing = await videos_col.find_one(
             {"file_unique_id": file_unique_id},
             {"seq": 1},
         )
-        return existing.get("seq") if existing else None
+        return {
+            "seq": existing.get("seq") if existing else None,
+            "status": "duplicate",
+        }
 
 
 # ============================================================
-# AUTO SAVE VIDEO - ORIGINAL HANDLER
+# AUTO SAVE VIDEO - ORIGINAL HANDLER + SCAN STORAGE COUNTS
 # ============================================================
+
+def is_forwarded_video_message(message):
+    # Telethon forwards to the bot's private chat arrive as forwarded messages.
+    # Count only forwarded videos while a scan is active, not ordinary uploads.
+    return bool(
+        getattr(message, "forward_origin", None)
+        or getattr(message, "forward_date", None)
+        or getattr(message, "forward_from", None)
+        or getattr(message, "forward_from_chat", None)
+    )
+
 
 async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     try:
-        await save_video_message(update.message)
+        result = await save_video_message(update.message)
+
+        if (
+            result
+            and active_scan_state_id
+            and is_forwarded_video_message(update.message)
+        ):
+            counter = "stored" if result["status"] == "stored" else "duplicates"
+            await scan_states_col.update_one(
+                {"_id": active_scan_state_id, "status": "running"},
+                {"$inc": {counter: 1}, "$set": {"updated_at": utc_now()}},
+            )
     except Exception:
         logger.exception("Video save failed")
+        if active_scan_state_id:
+            try:
+                await scan_states_col.update_one(
+                    {"_id": active_scan_state_id, "status": "running"},
+                    {"$inc": {"storage_errors": 1}},
+                    )
+            except Exception:
+                logger.exception("Could not update scan storage error counter")
 
 
 # ============================================================
-# SCAN FEATURE - NEW
+# SCAN FEATURE
 # ============================================================
 
 def scan_user_allowed(user):
     return bool(user and telethon_user_id and user.id == telethon_user_id)
+
+
+def scan_log_chat_id():
+    if not SCAN_LOG_GROUP_ID:
+        raise RuntimeError(
+            "SCAN_LOG_GROUP_ID is missing. Add your Update Group ID in Render."
+        )
+    try:
+        return int(SCAN_LOG_GROUP_ID)
+    except ValueError as exc:
+        raise RuntimeError("SCAN_LOG_GROUP_ID must be a numeric Telegram chat ID.") from exc
+
+
+async def get_chat_message_total(entity):
+    """Ask Telegram for the total history count without downloading message history."""
+    try:
+        result = await telethon_client.get_messages(entity, limit=0)
+        total = getattr(result, "total", None)
+        if total is None:
+            total = len(result)
+        return int(total)
+    except Exception:
+        logger.exception("Could not determine total message count")
+        return None
+
+
+async def get_forum_topic_count(entity):
+    """Return topic count for forum groups; None means Telegram did not provide it."""
+    if not bool(getattr(entity, "forum", False)):
+        return 0
+
+    try:
+        result = await telethon_client(
+            functions.messages.GetForumTopicsRequest(
+                peer=entity,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=1,
+            )
+        )
+        count = getattr(result, "count", None)
+        if count is not None:
+            return int(count)
+        return len(getattr(result, "topics", []) or [])
+    except Exception:
+        logger.exception("Could not read forum topic count")
+        return None
+
+
+async def send_scan_report(context, text):
+    await context.bot.send_message(
+        chat_id=scan_log_chat_id(),
+        text=text,
+        disable_web_page_preview=True,
+    )
+
+
+def scan_progress_text(
+    group_title, chat_type, checked, total_messages, video_messages,
+    forwarded, stored, duplicates, skipped, topics, last_message_id,
+):
+    remaining = (
+        max(total_messages - checked, 0)
+        if total_messages is not None else None
+    )
+    remaining_text = f"{remaining:,}" if remaining is not None else "Unavailable"
+    topic_text = str(topics) if topics is not None else "Unavailable"
+
+    return (
+        "🔄 SCAN PROGRESS UPDATE\n\n"
+        f"Chat: {group_title}\n"
+        f"Type: {chat_type}\n"
+        f"Messages checked: {checked:,}\n"
+        f"Messages remaining: {remaining_text}\n"
+        f"Video messages found: {video_messages:,}\n"
+        f"Forwarded to bot: {forwarded:,}\n"
+        f"Actually stored: {stored:,}\n"
+        f"Duplicates ignored: {duplicates:,}\n"
+        f"Could not forward: {skipped:,}\n"
+        f"Forum topics: {topic_text}\n"
+        f"Last message ID: {last_message_id}\n\n"
+        "Note: Stored/duplicate counts update when the bot receives each forwarded video."
+    )
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,21 +501,44 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("🔍 Loading groups from your Personal Telegram Account...")
+    try:
+        log_id = scan_log_chat_id()
+        # Verify the Bot API can access the configured report group before listing chats.
+        await context.bot.send_message(
+            chat_id=log_id,
+            text="🟢 Video Storage Bot: scan reporting connection is ready.",
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            "❌ Update Group is not configured or the bot cannot send messages there.\n\n"
+            "Set SCAN_LOG_GROUP_ID to the group's numeric ID in Render, add the bot "
+            "to that group, and allow it to send messages.\n\n"
+            f"Error: {type(exc).__name__}"
+        )
+        return
+
+    await update.message.reply_text(
+        "🔍 Loading groups and channels from your Personal Telegram Account..."
+    )
 
     try:
         scan_groups_cache = []
         async for dialog in telethon_client.iter_dialogs():
-            if dialog.is_group:
+            # Includes groups, supergroups and broadcast channels; excludes users.
+            if dialog.is_group or dialog.is_channel:
+                is_broadcast = bool(
+                    dialog.is_channel and not dialog.is_group
+                )
                 scan_groups_cache.append({
                     "id": int(dialog.id),
-                    "title": dialog.title or "Unnamed group",
+                    "title": dialog.title or "Unnamed chat",
                     "entity": dialog.entity,
+                    "chat_type": "Channel" if is_broadcast else "Group/Supergroup",
                 })
 
         if not scan_groups_cache:
             await update.message.reply_text(
-                "No accessible groups found in this Telegram account."
+                "No accessible groups or channels found in this Telegram account."
             )
             return
 
@@ -404,9 +550,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception:
-        logger.exception("Could not list Telegram groups")
+        logger.exception("Could not list Telegram groups/channels")
         await update.message.reply_text(
-            "❌ Could not load groups. Check the Personal Account session and group access."
+            "❌ Could not load groups/channels. Check the Personal Account session and access."
         )
 
 
@@ -417,10 +563,11 @@ async def send_scan_group_page(chat_id, context, page, edit_message_id=None):
 
     buttons = []
     for group in scan_groups_cache[start:end]:
-        title = (group["title"] or "Unnamed group")[:48]
+        title = (group["title"] or "Unnamed chat")[:42]
+        label = f"📢 {title}" if group.get("chat_type") == "Channel" else f"👥 {title}"
         buttons.append([
             InlineKeyboardButton(
-                title,
+                label,
                 callback_data=f"scanstart:{group['id']}",
             )
         ])
@@ -439,10 +586,10 @@ async def send_scan_group_page(chat_id, context, page, edit_message_id=None):
 
     markup = InlineKeyboardMarkup(buttons)
     text = (
-        "📂 YOUR TELEGRAM GROUPS\n\n"
-        f"Total groups: {len(scan_groups_cache)}\n"
+        "📂 YOUR TELEGRAM GROUPS & CHANNELS\n\n"
+        f"Total chats: {len(scan_groups_cache)}\n"
         f"Page: {page + 1} / {max(1, (len(scan_groups_cache) + page_size - 1) // page_size)}\n\n"
-        "Choose the group you want to scan:"
+        "Choose a group or channel to scan:"
     )
 
     if edit_message_id:
@@ -461,15 +608,14 @@ async def send_scan_group_page(chat_id, context, page, edit_message_id=None):
 
 
 async def scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_scan_task, active_scan_group_id
+    global active_scan_task, active_scan_group_id, active_scan_state_id
 
     query = update.callback_query
-    await query.answer()
-
     if not scan_user_allowed(query.from_user):
         await query.answer("Not authorized.", show_alert=True)
         return
 
+    await query.answer()
     data = query.data or ""
 
     if data.startswith("scanpage:"):
@@ -489,12 +635,12 @@ async def scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_id = int(data.split(":", 1)[1])
         except ValueError:
-            await query.message.reply_text("Invalid group selection.")
+            await query.message.reply_text("Invalid group/channel selection.")
             return
 
         if active_scan_task and not active_scan_task.done():
             await query.message.reply_text(
-                f"⚠️ A scan is already running for group ID {active_scan_group_id}."
+                f"⚠️ A scan is already running for chat ID {active_scan_group_id}."
             )
             return
 
@@ -504,24 +650,32 @@ async def scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not group:
             await query.message.reply_text(
-                "Group selection expired. Send /scan again."
+                "Selection expired. Send /scan again."
             )
+            return
+
+        try:
+            report_chat_id = scan_log_chat_id()
+        except Exception as exc:
+            await query.message.reply_text(f"❌ {exc}")
             return
 
         await query.message.reply_text(
             "🚀 SCAN STARTED\n\n"
-            f"Group: {group['title']}\n"
-            "Only messages recognized as Telegram videos will be forwarded.\n"
-            "The existing Storage Bot duplicate check will decide whether to save."
+            f"Chat: {group['title']}\n"
+            f"Type: {group['chat_type']}\n"
+            "Progress and completion reports will be sent to the Update Group."
         )
 
         active_scan_group_id = chat_id
+        active_scan_state_id = f"scan_{chat_id}"
         active_scan_task = asyncio.create_task(
             scan_group_history(
                 entity=group["entity"],
                 chat_id=chat_id,
                 group_title=group["title"],
-                report_chat_id=query.message.chat_id,
+                chat_type=group["chat_type"],
+                report_chat_id=report_chat_id,
                 context=context,
             )
         )
@@ -531,19 +685,16 @@ async def scan_group_history(
     entity,
     chat_id,
     group_title,
+    chat_type,
     report_chat_id,
     context,
 ):
     """
-    Reads old messages in ascending order and forwards video messages
-    to this bot's private chat. The Bot API video_handler then stores
-    them using the same file_unique_id duplicate check as normal videos.
-
-    Checkpoint is saved after each source message. If a crash occurs
-    after forwarding but before checkpoint, that message may be forwarded
-    again on resume; save_video_message ignores an already stored duplicate.
+    Scans old messages in ascending order and forwards video messages to the bot.
+    The Bot API video handler stores each received video using the existing
+    file_unique_id duplicate check. Scan checkpoints and counters are persisted.
     """
-    global active_scan_group_id
+    global active_scan_group_id, active_scan_state_id
 
     state_id = f"scan_{chat_id}"
     state = await scan_states_col.find_one({"_id": state_id})
@@ -553,20 +704,45 @@ async def scan_group_history(
     video_messages = int(state.get("video_messages", 0)) if state else 0
     forwarded = int(state.get("forwarded", 0)) if state else 0
     skipped = int(state.get("skipped", 0)) if state else 0
+    stored = int(state.get("stored", 0)) if state else 0
+    duplicates = int(state.get("duplicates", 0)) if state else 0
+    storage_errors = int(state.get("storage_errors", 0)) if state else 0
+
+    total_messages = await get_chat_message_total(entity)
+    topics = await get_forum_topic_count(entity)
 
     await scan_states_col.update_one(
         {"_id": state_id},
         {"$set": {
             "group_id": chat_id,
             "group_title": group_title,
+            "chat_type": chat_type,
             "status": "running",
+            "total_messages": total_messages,
+            "topics": topics,
             "started_at": state.get("started_at", utc_now()) if state else utc_now(),
             "updated_at": utc_now(),
+        }, "$setOnInsert": {
+            "stored": 0,
+            "duplicates": 0,
+            "storage_errors": 0,
         }},
         upsert=True,
     )
 
+    loop = asyncio.get_running_loop()
+    last_report_time = loop.time()
+
     try:
+        total_text = f"{total_messages:,}" if total_messages is not None else "Unavailable"
+        await send_scan_report(
+            context,
+            "🚀 SCAN STARTED\n\n"
+            f"Chat: {group_title}\n"
+            f"Type: {chat_type}\n"
+            f"Total messages: {total_text}",
+        )
+
         # min_id is exclusive. reverse=True scans oldest to newest.
         async for message in telethon_client.iter_messages(
             entity,
@@ -582,7 +758,7 @@ async def scan_group_history(
                 while not sent:
                     try:
                         # Forwarding preserves Telegram's original media identity.
-                        # Protected-content messages cannot be forwarded; we do not bypass that restriction.
+                        # Protected-content messages cannot be forwarded; no bypass is attempted.
                         await telethon_client.forward_messages(
                             telethon_bot_username,
                             message,
@@ -605,7 +781,7 @@ async def scan_group_history(
 
             last_message_id = int(message.id)
 
-            # Save checkpoint after each message.
+            # Save checkpoint after each source message.
             await scan_states_col.update_one(
                 {"_id": state_id},
                 {"$set": {
@@ -620,24 +796,38 @@ async def scan_group_history(
                 upsert=True,
             )
 
+            # Refresh stored/duplicate counters, which are updated by video_handler.
             if SCAN_DELAY > 0:
                 await asyncio.sleep(SCAN_DELAY)
 
-            if SCAN_PROGRESS_EVERY > 0 and checked % SCAN_PROGRESS_EVERY == 0:
-                await context.bot.send_message(
-                    chat_id=report_chat_id,
-                    text=(
-                        "🔄 SCAN PROGRESS\n\n"
-                        f"Group: {group_title}\n"
-                        f"Messages checked: {checked:,}\n"
-                        f"Video messages found: {video_messages:,}\n"
-                        f"Forwarded to bot: {forwarded:,}\n"
-                        f"Could not forward: {skipped:,}\n"
-                        f"Last message ID: {last_message_id}\n\n"
-                        "The bot's existing file_unique_id check ignores stored duplicates."
+            now_mono = loop.time()
+            if now_mono - last_report_time >= SCAN_REPORT_INTERVAL_SECONDS:
+                current_state = await scan_states_col.find_one({"_id": state_id}) or {}
+                stored = int(current_state.get("stored", stored))
+                duplicates = int(current_state.get("duplicates", duplicates))
+                storage_errors = int(current_state.get("storage_errors", storage_errors))
+
+                await send_scan_report(
+                    context,
+                    scan_progress_text(
+                        group_title, chat_type, checked, total_messages,
+                        video_messages, forwarded, stored, duplicates, skipped,
+                        topics, last_message_id,
                     ),
                 )
+                last_report_time = now_mono
 
+        # Give Bot API polling a short time to process the final forwarded videos.
+        await asyncio.sleep(5)
+        current_state = await scan_states_col.find_one({"_id": state_id}) or {}
+        stored = int(current_state.get("stored", stored))
+        duplicates = int(current_state.get("duplicates", duplicates))
+        storage_errors = int(current_state.get("storage_errors", storage_errors))
+
+        remaining = (
+            max(total_messages - checked, 0)
+            if total_messages is not None else None
+        )
         await scan_states_col.update_one(
             {"_id": state_id},
             {"$set": {
@@ -645,26 +835,37 @@ async def scan_group_history(
                 "checked": checked,
                 "video_messages": video_messages,
                 "forwarded": forwarded,
+                "stored": stored,
+                "duplicates": duplicates,
                 "skipped": skipped,
+                "storage_errors": storage_errors,
+                "remaining_messages": remaining,
                 "completed_at": utc_now(),
                 "updated_at": utc_now(),
             }},
         )
 
-        await context.bot.send_message(
-            chat_id=report_chat_id,
-            text=(
-                "✅ SCAN COMPLETED\n\n"
-                f"Group: {group_title}\n"
-                f"Messages checked: {checked:,}\n"
-                f"Video messages found: {video_messages:,}\n"
-                f"Forwarded to bot: {forwarded:,}\n"
-                f"Could not forward: {skipped:,}\n\n"
-                "The bot's duplicate checker ignored videos already in storage."
-            ),
+        remaining_text = f"{remaining:,}" if remaining is not None else "Unavailable"
+        topic_text = str(topics) if topics is not None else "Unavailable"
+        await send_scan_report(
+            context,
+            "✅ SCAN COMPLETED\n\n"
+            f"Chat: {group_title}\n"
+            f"Type: {chat_type}\n"
+            f"Messages checked: {checked:,}\n"
+            f"Messages remaining: {remaining_text}\n"
+            f"Video messages found: {video_messages:,}\n"
+            f"Forwarded to bot: {forwarded:,}\n"
+            f"Actually stored: {stored:,}\n"
+            f"Duplicates ignored: {duplicates:,}\n"
+            f"Could not forward: {skipped:,}\n"
+            f"Storage errors: {storage_errors:,}\n"
+            f"Forum topics: {topic_text}\n\n"
+            "✅ Scan finished. Checkpoint saved.",
         )
 
     except asyncio.CancelledError:
+        current_state = await scan_states_col.find_one({"_id": state_id}) or {}
         await scan_states_col.update_one(
             {"_id": state_id},
             {"$set": {
@@ -673,6 +874,8 @@ async def scan_group_history(
                 "checked": checked,
                 "video_messages": video_messages,
                 "forwarded": forwarded,
+                "stored": int(current_state.get("stored", stored)),
+                "duplicates": int(current_state.get("duplicates", duplicates)),
                 "skipped": skipped,
                 "updated_at": utc_now(),
             }},
@@ -682,6 +885,11 @@ async def scan_group_history(
 
     except Exception as exc:
         logger.exception("Scan failed")
+        current_state = await scan_states_col.find_one({"_id": state_id}) or {}
+        stored = int(current_state.get("stored", stored))
+        duplicates = int(current_state.get("duplicates", duplicates))
+        storage_errors = int(current_state.get("storage_errors", storage_errors))
+
         await scan_states_col.update_one(
             {"_id": state_id},
             {"$set": {
@@ -690,24 +898,31 @@ async def scan_group_history(
                 "checked": checked,
                 "video_messages": video_messages,
                 "forwarded": forwarded,
+                "stored": stored,
+                "duplicates": duplicates,
                 "skipped": skipped,
+                "storage_errors": storage_errors,
                 "error": str(exc),
                 "updated_at": utc_now(),
             }},
             upsert=True,
         )
-        await context.bot.send_message(
-            chat_id=report_chat_id,
-            text=(
-                "⚠️ SCAN STOPPED\n\n"
-                f"Group: {group_title}\n"
-                f"Messages checked: {checked:,}\n"
-                f"Last message ID: {last_message_id}\n\n"
-                "Progress is saved. Send /scan and select this group again to continue."
-            ),
+        await send_scan_report(
+            context,
+            "⚠️ SCAN STOPPED / PAUSED\n\n"
+            f"Chat: {group_title}\n"
+            f"Messages checked: {checked:,}\n"
+            f"Video messages found: {video_messages:,}\n"
+            f"Forwarded to bot: {forwarded:,}\n"
+            f"Actually stored: {stored:,}\n"
+            f"Duplicates ignored: {duplicates:,}\n"
+            f"Could not forward: {skipped:,}\n"
+            f"Last message ID: {last_message_id}\n\n"
+            "Progress is saved. Send /scan and select this chat again to continue."
         )
     finally:
         active_scan_group_id = None
+        active_scan_state_id = None
 
 
 # ============================================================
@@ -1341,7 +1556,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel [JOB_ID] - Cancel sendall job\n"
         "/recover JOB_ID SEQ - Recover uncertain sendall job\n"
         "/delete ID - Delete one video\n"
-        "/scan - Scan videos from your Telegram groups\n\n"
+        "/scan - Scan videos from your Telegram groups and channels\n\n"
         "Videos sent to this bot as Telegram videos are automatically saved."
     )
 
@@ -1388,7 +1603,6 @@ def build_application():
     application.add_handler(CommandHandler("recover", cmd_recover))
     application.add_handler(CommandHandler("delete", cmd_delete))
 
-    # New scan command and inline group-selection buttons.
     application.add_handler(CommandHandler("scan", cmd_scan))
     application.add_handler(
         CallbackQueryHandler(scan_callback, pattern=r"^scan(?:page|start):")
